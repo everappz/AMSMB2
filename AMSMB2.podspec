@@ -24,4 +24,8 @@ Pod::Spec.new do |s|
   s.source_files = 'AMSMB2/**/*.swift'
 
   s.dependency 'libsmb2'
+
+  s.pod_target_xcconfig = {
+    'GCC_PREPROCESSOR_DEFINITIONS' => '$(inherited) HAVE_STDINT_H=1 HAVE_TIME_H=1',
+  }
 end
