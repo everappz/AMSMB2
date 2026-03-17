@@ -628,6 +628,159 @@ class SMB2ManagerTests: XCTestCase, @unchecked Sendable {
         try await smb.removeDirectory(atPath: "\(folderName())", recursive: true)
     }
     
+    // MARK: - Umlaut Tests
+
+    func testUmlautFileOperations() async throws {
+        let smb = SMB2Manager(url: server, credential: credential)!
+        let file1 = "Ärger_Öffnung_Über.dat"
+        let file2 = "Ünterführung_Ähnlich.dat"
+
+        addTeardownBlock {
+            try? await smb.removeFile(atPath: file1)
+            try? await smb.removeFile(atPath: file2)
+        }
+
+        try await smb.connectShare(name: share, encrypted: encrypted)
+
+        // Write file with umlauts
+        let data = randomData(size: 2048)
+        try await smb.write(data: data, toPath: file1, progress: nil)
+
+        // Read back and verify
+        let readData = try await smb.contents(atPath: file1)
+        XCTAssertEqual(data, readData)
+
+        // Check attributes
+        let attribs = try await smb.attributesOfItem(atPath: file1)
+        XCTAssertEqual(attribs.fileSize, Int64(data.count))
+
+        // Rename to another umlaut name
+        try await smb.moveItem(atPath: file1, toPath: file2)
+        let renamedData = try await smb.contents(atPath: file2)
+        XCTAssertEqual(data, renamedData)
+
+        // Verify original is gone
+        do {
+            _ = try await smb.attributesOfItem(atPath: file1)
+            XCTFail("Original file should not exist after rename")
+        } catch {}
+
+        // Delete
+        try await smb.removeFile(atPath: file2)
+    }
+
+    func testUmlautDirectoryOperations() async throws {
+        let smb = SMB2Manager(url: server, credential: credential)!
+        let dir1 = "Bücher_Wörter"
+        let dir2 = "Größe_Übung"
+        let fileInDir = "\(dir1)/Prüfung.dat"
+
+        addTeardownBlock {
+            try? await smb.removeFile(atPath: "\(dir2)/Prüfung.dat")
+            try? await smb.removeFile(atPath: "\(dir1)/Prüfung.dat")
+            try? await smb.removeDirectory(atPath: dir2, recursive: false)
+            try? await smb.removeDirectory(atPath: dir1, recursive: false)
+        }
+
+        try await smb.connectShare(name: share, encrypted: encrypted)
+
+        // Pre-cleanup from previous runs
+        try? await smb.removeFile(atPath: "\(dir2)/Prüfung.dat")
+        try? await smb.removeDirectory(atPath: dir2, recursive: false)
+        try? await smb.removeFile(atPath: "\(dir1)/Prüfung.dat")
+        try? await smb.removeDirectory(atPath: dir1, recursive: false)
+        usleep(200_000)
+
+        // Create directory with umlauts
+        do {
+            try await smb.createDirectory(atPath: dir1)
+        } catch {
+            XCTFail("createDirectory(\(dir1)) failed: \(error)")
+            return
+        }
+
+        // Write file inside umlaut directory
+        let data = randomData(size: 1024)
+        do {
+            try await smb.write(data: data, toPath: fileInDir, progress: nil)
+        } catch {
+            XCTFail("write to \(fileInDir) failed: \(error)")
+            return
+        }
+
+        // List directory contents
+        let contents = try await smb.contentsOfDirectory(atPath: dir1)
+        XCTAssertEqual(contents.count, 1)
+        XCTAssertEqual(contents.first?.name, "Prüfung.dat")
+
+        // Read file back
+        let readData = try await smb.contents(atPath: fileInDir)
+        XCTAssertEqual(data, readData)
+
+        // Move directory to another umlaut name
+        do {
+            try await smb.moveItem(atPath: dir1, toPath: dir2)
+        } catch {
+            XCTFail("moveItem(\(dir1) -> \(dir2)) failed: \(error)")
+            return
+        }
+
+        // Verify file still accessible under new path
+        let movedData = try await smb.contents(atPath: "\(dir2)/Prüfung.dat")
+        XCTAssertEqual(data, movedData)
+    }
+
+    func testUmlautUploadDownload() async throws {
+        let smb = SMB2Manager(url: server, credential: credential)!
+        let remoteName = "Äpfel_und_Würstchen.dat"
+        let size = 4096
+        let url = dummyFile(size: size)
+        let dlURL = url.appendingPathExtension("downloaded")
+
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: url)
+            try? FileManager.default.removeItem(at: dlURL)
+            try? await smb.removeFile(atPath: remoteName)
+        }
+
+        try await smb.connectShare(name: share, encrypted: encrypted)
+
+        // Upload to umlaut path
+        try await smb.uploadItem(at: url, toPath: remoteName, progress: nil)
+
+        // Download from umlaut path
+        try await smb.downloadItem(atPath: remoteName, to: dlURL, progress: nil)
+
+        // Verify contents match
+        XCTAssert(FileManager.default.contentsEqual(atPath: url.path, andPath: dlURL.path))
+    }
+
+    func testUmlautCopy() async throws {
+        let smb = SMB2Manager(url: server, credential: credential)!
+        let src = "Lösung_Füße.dat"
+        let dst = "Größenänderung.dat"
+
+        addTeardownBlock {
+            try? await smb.removeFile(atPath: src)
+            try? await smb.removeFile(atPath: dst)
+        }
+
+        try await smb.connectShare(name: share, encrypted: encrypted)
+
+        // Write source with umlauts
+        let data = randomData(size: 8192)
+        try await smb.write(data: data, toPath: src, progress: nil)
+
+        // Server-side copy to another umlaut name
+        try await smb.copyItem(atPath: src, toPath: dst, recursive: false, progress: nil)
+
+        // Verify both files exist and match
+        let srcData = try await smb.contents(atPath: src)
+        let dstData = try await smb.contents(atPath: dst)
+        XCTAssertEqual(data, srcData)
+        XCTAssertEqual(data, dstData)
+    }
+
     func testMonitor() async throws {
         try XCTSkipIf(true)
         let smb = SMB2Manager(url: server, credential: credential)!

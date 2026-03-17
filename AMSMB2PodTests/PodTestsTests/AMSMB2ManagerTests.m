@@ -694,6 +694,167 @@ static NSString *const kSMBPassword      = @"Derparol3";
     [self waitForExpectation:exp];
 }
 
+#pragma mark - Umlauts (Non-ASCII paths)
+
+- (void)testUmlautFileOperations {
+    XCTestExpectation *exp = [self expectationWithDescription:@"umlaut-file"];
+    NSString *file = @"Ärger_Öffnung_Über.dat";
+    NSString *renamed = @"Ünterführung_Ähnlich.dat";
+    NSData *data = RandomData(256);
+    AMSMB2Manager *smb = [self newManager];
+
+    [self connectManager:smb completion:^(NSError *error) {
+        XCTAssertNil(error);
+        [self cleanupFilesOnManager:smb paths:@[file, renamed] completion:^{
+            // Write file with umlauts in name
+            [smb writeData:data toPath:file progress:nil completionHandler:^(NSError *writeErr) {
+                XCTAssertNil(writeErr);
+                // Read back
+                [smb contentsAtPath:file fromOffset:0 toLength:-1 progress:nil completionHandler:^(NSData *rdata, NSError *readErr) {
+                    XCTAssertNil(readErr);
+                    XCTAssertEqualObjects(data, rdata);
+                    // Get attributes
+                    [smb attributesOfItemAtPath:file completionHandler:^(NSDictionary *attribs, NSError *attrErr) {
+                        XCTAssertNil(attrErr);
+                        XCTAssertEqual([attribs[NSURLFileSizeKey] longLongValue], (int64_t)data.length);
+                        // Rename to another umlaut name
+                        [smb moveItemAtPath:file toPath:renamed completionHandler:^(NSError *moveErr) {
+                            XCTAssertNil(moveErr);
+                            // Read renamed file
+                            [smb contentsAtPath:renamed fromOffset:0 toLength:-1 progress:nil completionHandler:^(NSData *rdata2, NSError *readErr2) {
+                                XCTAssertNil(readErr2);
+                                XCTAssertEqualObjects(data, rdata2);
+                                // Cleanup
+                                [smb removeFileAtPath:renamed completionHandler:^(NSError *rmErr) {
+                                    XCTAssertNil(rmErr);
+                                    [exp fulfill];
+                                }];
+                            }];
+                        }];
+                    }];
+                }];
+            }];
+        }];
+    }];
+
+    [self waitForExpectation:exp];
+}
+
+- (void)testUmlautDirectoryOperations {
+    XCTestExpectation *exp = [self expectationWithDescription:@"umlaut-dir"];
+    NSString *folder = @"Bücher_Wörter";
+    NSString *dest = @"Größe_Übung";
+    NSString *subFile = [NSString stringWithFormat:@"%@/Prüfung.dat", folder];
+    NSData *data = RandomData(128);
+    AMSMB2Manager *smb = [self newManager];
+
+    [self connectManager:smb completion:^(NSError *error) {
+        XCTAssertNil(error);
+        // Pre-cleanup
+        [smb removeDirectoryAtPath:dest recursive:YES completionHandler:^(NSError *pre1) {
+        [smb removeDirectoryAtPath:folder recursive:YES completionHandler:^(NSError *pre2) {
+        usleep(200000);
+        // Create directory with umlauts
+        [smb createDirectoryAtPath:folder completionHandler:^(NSError *mkErr) {
+            XCTAssertNil(mkErr);
+            // Write file inside umlaut directory
+            [smb writeData:data toPath:subFile progress:nil completionHandler:^(NSError *writeErr) {
+                XCTAssertNil(writeErr);
+                // List contents
+                [smb contentsOfDirectoryAtPath:folder recursive:NO completionHandler:^(NSArray *contents, NSError *listErr) {
+                    XCTAssertNil(listErr);
+                    XCTAssertEqual(contents.count, 1);
+                    XCTAssertTrue([contents.firstObject[NSURLNameKey] containsString:@"Prüfung"]);
+                    // Move directory to another umlaut name
+                    [smb removeFileAtPath:subFile completionHandler:^(NSError *rmFileErr) {
+                        [smb removeDirectoryAtPath:folder recursive:NO completionHandler:^(NSError *rmDirErr) {
+                            XCTAssertNil(rmDirErr);
+                            usleep(200000);
+                            [smb createDirectoryAtPath:folder completionHandler:^(NSError *mkErr2) {
+                                XCTAssertNil(mkErr2);
+                                [smb moveItemAtPath:folder toPath:dest completionHandler:^(NSError *moveErr) {
+                                    XCTAssertNil(moveErr);
+                                    // Cleanup
+                                    [smb removeDirectoryAtPath:dest recursive:YES completionHandler:^(NSError *rmErr) {
+                                        XCTAssertNil(rmErr);
+                                        [exp fulfill];
+                                    }];
+                                }];
+                            }];
+                        }];
+                    }];
+                }];
+            }];
+        }];
+        }]; // pre2
+        }]; // pre1
+    }];
+
+    [self waitForExpectation:exp];
+}
+
+- (void)testUmlautUploadDownload {
+    XCTestExpectation *exp = [self expectationWithDescription:@"umlaut-upload"];
+    NSString *file = @"Äpfel_und_Würstchen.dat";
+    NSInteger size = 1024 + RandomInt(4096);
+    NSURL *url = [self dummyFileWithSize:size name:@"umlaut_upload"];
+    NSURL *dlURL = [url URLByAppendingPathExtension:@"downloaded"];
+    AMSMB2Manager *smb = [self newManager];
+
+    [self connectManager:smb completion:^(NSError *error) {
+        XCTAssertNil(error);
+        [self cleanupFilesOnManager:smb paths:@[file] completion:^{
+            [smb uploadItemAtURL:url toPath:file progress:nil completionHandler:^(NSError *upErr) {
+                XCTAssertNil(upErr);
+                [smb downloadItemAtPath:file toURL:dlURL progress:nil completionHandler:^(NSError *dlErr) {
+                    XCTAssertNil(dlErr);
+                    XCTAssertTrue([NSFileManager.defaultManager contentsEqualAtPath:url.path andPath:dlURL.path]);
+                    // Cleanup
+                    [smb removeFileAtPath:file completionHandler:^(NSError *rmErr) {
+                        [NSFileManager.defaultManager removeItemAtURL:url error:nil];
+                        [NSFileManager.defaultManager removeItemAtURL:dlURL error:nil];
+                        [exp fulfill];
+                    }];
+                }];
+            }];
+        }];
+    }];
+
+    [self waitForExpectation:exp];
+}
+
+- (void)testUmlautCopy {
+    XCTestExpectation *exp = [self expectationWithDescription:@"umlaut-copy"];
+    NSString *file = @"Lösung_Füße.dat";
+    NSString *destFile = @"Größenänderung.dat";
+    NSData *data = RandomData(512);
+    AMSMB2Manager *smb = [self newManager];
+
+    [self connectManager:smb completion:^(NSError *error) {
+        XCTAssertNil(error);
+        [self cleanupFilesOnManager:smb paths:@[file, destFile] completion:^{
+            [smb writeData:data toPath:file progress:nil completionHandler:^(NSError *writeErr) {
+                XCTAssertNil(writeErr);
+                [smb copyItemAtPath:file toPath:destFile recursive:NO progress:nil completionHandler:^(NSError *copyErr) {
+                    XCTAssertNil(copyErr);
+                    [smb contentsAtPath:destFile fromOffset:0 toLength:-1 progress:nil completionHandler:^(NSData *rdata, NSError *readErr) {
+                        XCTAssertNil(readErr);
+                        XCTAssertEqualObjects(data, rdata);
+                        // Cleanup
+                        [smb removeFileAtPath:file completionHandler:^(NSError *rmErr) {
+                            [smb removeFileAtPath:destFile completionHandler:^(NSError *rmErr2) {
+                                [exp fulfill];
+                            }];
+                        }];
+                    }];
+                }];
+            }];
+        }];
+    }];
+
+    [self waitForExpectation:exp];
+}
+
 #pragma mark - Helpers
 
 - (void)cleanupFilesOnManager:(AMSMB2Manager *)smb paths:(NSArray<NSString *> *)paths completion:(void (^)(void))completion {
