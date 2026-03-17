@@ -29,6 +29,11 @@ static uint32_t RandomInt(uint32_t max) {
     return arc4random_uniform(max + 1);
 }
 
+static NSString *const kSMBServerAddress = @"smb://192.168.1.131";
+static NSString *const kSMBShareName     = @"test";
+static NSString *const kSMBUser          = @"testtest";
+static NSString *const kSMBPassword      = @"Derparol3";
+
 @interface AMSMB2ManagerTests : XCTestCase
 @property (nonatomic, strong) NSURL *server;
 @property (nonatomic, copy) NSString *share;
@@ -40,20 +45,12 @@ static uint32_t RandomInt(uint32_t max) {
 
 - (void)setUp {
     [super setUp];
-    NSString *serverStr = NSProcessInfo.processInfo.environment[@"SMB_SERVER"];
-    XCTAssertNotNil(serverStr, @"SMB_SERVER environment variable must be set");
-    self.server = [NSURL URLWithString:serverStr];
-    self.share = NSProcessInfo.processInfo.environment[@"SMB_SHARE"];
-    XCTAssertNotNil(self.share, @"SMB_SHARE environment variable must be set");
-
-    NSString *user = NSProcessInfo.processInfo.environment[@"SMB_USER"];
-    NSString *pass = NSProcessInfo.processInfo.environment[@"SMB_PASSWORD"];
-    if (user && pass) {
-        self.credential = [NSURLCredential credentialWithUser:user
-                                                     password:pass
-                                                  persistence:NSURLCredentialPersistenceForSession];
-    }
-    self.encrypted = [NSProcessInfo.processInfo.environment[@"SMB_ENCRYPTED"] isEqualToString:@"1"];
+    self.server = [NSURL URLWithString:kSMBServerAddress];
+    self.share = kSMBShareName;
+    self.credential = [NSURLCredential credentialWithUser:kSMBUser
+                                                 password:kSMBPassword
+                                              persistence:NSURLCredentialPersistenceForSession];
+    self.encrypted = NO;
 }
 
 #pragma mark - Helpers
@@ -336,6 +333,10 @@ static uint32_t RandomInt(uint32_t max) {
 
     [self connectManager:smb completion:^(NSError *error) {
         XCTAssertNil(error);
+        // Pre-cleanup leftovers
+        [smb removeDirectoryAtPath:@"testEmpty" recursive:YES completionHandler:^(NSError *pre1) {
+        [smb removeDirectoryAtPath:@"testFull" recursive:YES completionHandler:^(NSError *pre2) {
+        usleep(200000); // Wait for server to clear delete-pending state
         [smb createDirectoryAtPath:@"testEmpty" completionHandler:^(NSError *mkErr) {
             XCTAssertNil(mkErr);
             [smb removeDirectoryAtPath:@"testEmpty" recursive:NO completionHandler:^(NSError *rmErr) {
@@ -352,6 +353,8 @@ static uint32_t RandomInt(uint32_t max) {
                 }];
             }];
         }];
+        }]; // pre2
+        }]; // pre1
     }];
 
     [self waitForExpectation:exp];
@@ -552,21 +555,24 @@ static uint32_t RandomInt(uint32_t max) {
 
     [self connectManager:smb completion:^(NSError *error) {
         XCTAssertNil(error);
-        [smb writeData:data toPath:file progress:nil completionHandler:^(NSError *writeErr) {
-            XCTAssertNil(writeErr);
-            [smb copyItemAtPath:file toPath:destFile recursive:NO progress:^BOOL(int64_t bytes, int64_t total) {
-                XCTAssertGreaterThan(bytes, 0);
-                XCTAssertEqual(total, (int64_t)data.length);
-                return YES;
-            } completionHandler:^(NSError *copyErr) {
-                XCTAssertNil(copyErr);
-                [smb attributesOfItemAtPath:destFile completionHandler:^(NSDictionary<NSURLResourceKey,id> *attribs, NSError *attrErr) {
-                    XCTAssertNil(attrErr);
-                    XCTAssertEqual([attribs[NSURLFileSizeKey] longLongValue], (int64_t)data.length);
-                    // Cleanup
-                    [smb removeFileAtPath:file completionHandler:^(NSError *rmErr) {
-                        [smb removeFileAtPath:destFile completionHandler:^(NSError *rmErr2) {
-                            [exp fulfill];
+        // Clean up leftover files from previous runs
+        [self cleanupFilesOnManager:smb paths:@[file, destFile] completion:^{
+            [smb writeData:data toPath:file progress:nil completionHandler:^(NSError *writeErr) {
+                XCTAssertNil(writeErr);
+                [smb copyItemAtPath:file toPath:destFile recursive:NO progress:^BOOL(int64_t bytes, int64_t total) {
+                    XCTAssertGreaterThan(bytes, 0);
+                    XCTAssertEqual(total, (int64_t)data.length);
+                    return YES;
+                } completionHandler:^(NSError *copyErr) {
+                    XCTAssertNil(copyErr);
+                    [smb attributesOfItemAtPath:destFile completionHandler:^(NSDictionary<NSURLResourceKey,id> *attribs, NSError *attrErr) {
+                        XCTAssertNil(attrErr);
+                        XCTAssertEqual([attribs[NSURLFileSizeKey] longLongValue], (int64_t)data.length);
+                        // Cleanup
+                        [smb removeFileAtPath:file completionHandler:^(NSError *rmErr) {
+                            [smb removeFileAtPath:destFile completionHandler:^(NSError *rmErr2) {
+                                [exp fulfill];
+                            }];
                         }];
                     }];
                 }];
@@ -587,6 +593,10 @@ static uint32_t RandomInt(uint32_t max) {
 
     [self connectManager:smb completion:^(NSError *error) {
         XCTAssertNil(error);
+        // Pre-cleanup leftovers
+        [smb removeDirectoryAtPath:folder recursive:YES completionHandler:^(NSError *pre1) {
+        [smb removeDirectoryAtPath:dest recursive:YES completionHandler:^(NSError *pre2) {
+        usleep(200000); // Wait for server to clear delete-pending state
         [smb createDirectoryAtPath:folder completionHandler:^(NSError *mkErr) {
             XCTAssertNil(mkErr);
             [smb moveItemAtPath:folder toPath:dest completionHandler:^(NSError *moveErr) {
@@ -597,6 +607,8 @@ static uint32_t RandomInt(uint32_t max) {
                 }];
             }];
         }];
+        }]; // pre2
+        }]; // pre1
     }];
 
     [self waitForExpectation:exp];
@@ -612,25 +624,31 @@ static uint32_t RandomInt(uint32_t max) {
 
     [self connectManager:smb completion:^(NSError *error) {
         XCTAssertNil(error);
-        [smb createDirectoryAtPath:root completionHandler:^(NSError *mkErr) {
-            XCTAssertNil(mkErr);
-            NSString *subdir = [NSString stringWithFormat:@"%@/subdir", root];
-            [smb createDirectoryAtPath:subdir completionHandler:^(NSError *mkErr2) {
-                XCTAssertNil(mkErr2);
-                NSString *filePath = [NSString stringWithFormat:@"%@/file", root];
-                NSData *fileData = [NSData dataWithBytes:"\x01\x02\x03" length:3];
-                [smb writeData:fileData toPath:filePath progress:nil completionHandler:^(NSError *writeErr) {
-                    XCTAssertNil(writeErr);
-                    [smb copyItemAtPath:root toPath:rootCopy recursive:YES progress:nil completionHandler:^(NSError *copyErr) {
-                        XCTAssertNil(copyErr);
-                        NSString *copiedFile = [NSString stringWithFormat:@"%@/file", rootCopy];
-                        [smb attributesOfItemAtPath:copiedFile completionHandler:^(NSDictionary<NSURLResourceKey,id> *attribs, NSError *attrErr) {
-                            XCTAssertNil(attrErr);
-                            XCTAssertEqual([attribs[NSURLFileSizeKey] longLongValue], 3);
-                            // Cleanup
-                            [smb removeDirectoryAtPath:root recursive:YES completionHandler:^(NSError *rmErr) {
-                                [smb removeDirectoryAtPath:rootCopy recursive:YES completionHandler:^(NSError *rmErr2) {
-                                    [exp fulfill];
+        // Clean up leftover directories from previous failed runs
+        [smb removeDirectoryAtPath:rootCopy recursive:YES completionHandler:^(NSError *pre1) {
+            [smb removeDirectoryAtPath:root recursive:YES completionHandler:^(NSError *pre2) {
+                usleep(200000); // Wait for server to clear delete-pending state
+                [smb createDirectoryAtPath:root completionHandler:^(NSError *mkErr) {
+                    XCTAssertNil(mkErr);
+                    NSString *subdir = [NSString stringWithFormat:@"%@/subdir", root];
+                    [smb createDirectoryAtPath:subdir completionHandler:^(NSError *mkErr2) {
+                        XCTAssertNil(mkErr2);
+                        NSString *filePath = [NSString stringWithFormat:@"%@/file", root];
+                        NSData *fileData = [NSData dataWithBytes:"\x01\x02\x03" length:3];
+                        [smb writeData:fileData toPath:filePath progress:nil completionHandler:^(NSError *writeErr) {
+                            XCTAssertNil(writeErr);
+                            [smb copyItemAtPath:root toPath:rootCopy recursive:YES progress:nil completionHandler:^(NSError *copyErr) {
+                                XCTAssertNil(copyErr);
+                                NSString *copiedFile = [NSString stringWithFormat:@"%@/file", rootCopy];
+                                [smb attributesOfItemAtPath:copiedFile completionHandler:^(NSDictionary<NSURLResourceKey,id> *attribs, NSError *attrErr) {
+                                    XCTAssertNil(attrErr);
+                                    XCTAssertEqual([attribs[NSURLFileSizeKey] longLongValue], 3);
+                                    // Cleanup
+                                    [smb removeDirectoryAtPath:root recursive:YES completionHandler:^(NSError *rmErr) {
+                                        [smb removeDirectoryAtPath:rootCopy recursive:YES completionHandler:^(NSError *rmErr2) {
+                                            [exp fulfill];
+                                        }];
+                                    }];
                                 }];
                             }];
                         }];
@@ -652,6 +670,9 @@ static uint32_t RandomInt(uint32_t max) {
 
     [self connectManager:smb completion:^(NSError *error) {
         XCTAssertNil(error);
+        // Clean up leftover directory from previous failed runs
+        [smb removeDirectoryAtPath:folder recursive:YES completionHandler:^(NSError *pre) {
+        usleep(200000); // Wait for server to clear delete-pending state
         [smb createDirectoryAtPath:folder completionHandler:^(NSError *mkErr) {
             XCTAssertNil(mkErr);
             NSString *subdir = [NSString stringWithFormat:@"%@/subdir", folder];
@@ -667,12 +688,28 @@ static uint32_t RandomInt(uint32_t max) {
                 }];
             }];
         }];
+        }]; // pre-cleanup
     }];
 
     [self waitForExpectation:exp];
 }
 
 #pragma mark - Helpers
+
+- (void)cleanupFilesOnManager:(AMSMB2Manager *)smb paths:(NSArray<NSString *> *)paths completion:(void (^)(void))completion {
+    if (paths.count == 0) {
+        // Wait for server to finish processing any delete-pending state.
+        usleep(200000);
+        completion();
+        return;
+    }
+    NSMutableArray *remaining = [paths mutableCopy];
+    NSString *path = remaining.firstObject;
+    [remaining removeObjectAtIndex:0];
+    [smb removeFileAtPath:path completionHandler:^(NSError *err) {
+        [self cleanupFilesOnManager:smb paths:remaining completion:completion];
+    }];
+}
 
 - (NSURL *)dummyFileWithSize:(NSInteger)size name:(NSString *)name {
     NSString *fileName = FileName(name, nil);

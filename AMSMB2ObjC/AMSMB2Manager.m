@@ -589,8 +589,32 @@ static NSString *const kCodingKeyTimeout = @"timeout";
             return;
         }
 
-        NSInputStream *stream = [NSInputStream inputStreamWithData:data];
-        [self writeWithClient:client fromStream:stream toPath:path offset:nil chunkSize:0 progress:progress error:&error];
+        // Use overwrite mode (creates or replaces existing file).
+        SMB2FileHandle *file = [[SMB2FileHandle alloc] initForOverwritingAtPath:path on:client error:&error];
+        if (!file) {
+            if (completionHandler) completionHandler(error);
+            return;
+        }
+
+        NSInteger chunkSize = file.optimizedWriteSize;
+        uint64_t totalWritten = 0;
+
+        while (totalWritten < data.length) {
+            NSUInteger len = (NSUInteger)MIN(chunkSize, (NSInteger)(data.length - totalWritten));
+            NSData *chunk = [data subdataWithRange:NSMakeRange((NSUInteger)totalWritten, len)];
+            NSInteger written = [file pwriteData:chunk offset:totalWritten error:&error];
+            if (error) break;
+            if (written != (NSInteger)len) {
+                error = SMB2POSIXError(EIO, @"Inconsistency in writing to SMB file handle.");
+                break;
+            }
+            totalWritten += (uint64_t)written;
+            if (progress && !progress((int64_t)totalWritten)) break;
+        }
+
+        if (!error) {
+            [file fsyncWithError:&error];
+        }
         if (completionHandler) completionHandler(error);
     }];
 }
@@ -952,7 +976,9 @@ static NSString *const kCodingKeyTimeout = @"timeout";
     NSData *sourceKey = [fileSource requestResumeKeyWithError:error];
     if (!sourceKey) return -1;
 
-    NSInteger chunkSize = fileSource.optimizedWriteSize;
+    // SMB2 servers typically limit copy chunks to 1MB (MaxChunkTransferSize).
+    // optimizedWriteSize returns ~8MB which exceeds this, causing STATUS_INVALID_PARAMETER.
+    NSInteger chunkSize = MIN(fileSource.optimizedWriteSize, 1048576);
 
     SMB2FileHandle *fileDest = [[SMB2FileHandle alloc] initForCreatingIfNotExistsAtPath:toPath on:client error:error];
     if (!fileDest) return -1;
@@ -964,7 +990,11 @@ static NSString *const kCodingKeyTimeout = @"timeout";
         uint32_t len = (uint32_t)MIN((uint64_t)chunkSize, (uint64_t)size - offset);
         NSData *chunkData = SMB2IOCtlBuildCopyChunkCopy(sourceKey, offset, offset, len);
         [fileDest copyChunk:chunkData error:error];
-        if (error && *error) return -1;
+        if (error && *error) {
+            // Keep fileSource alive during copy (resume key requires open source handle).
+            (void)fileSource;
+            return -1;
+        }
 
         bytesCopied = (int64_t)(offset + len);
         if (progress) {
@@ -972,6 +1002,8 @@ static NSString *const kCodingKeyTimeout = @"timeout";
         }
     }
 
+    // Keep fileSource alive during copy (resume key requires open source handle).
+    (void)fileSource;
     return shouldContinue ? size : -1;
 }
 

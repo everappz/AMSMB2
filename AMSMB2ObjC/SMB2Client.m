@@ -263,10 +263,16 @@ static void smb2_generic_handler(struct smb2_context *smb2, int status, void *co
 
         int32_t serviceResult = smb2_service(_context, (int32_t)pfd.revents);
         if (serviceResult < 0) {
+            // Capture error description before destroying context.
+            NSString *desc = nil;
+            const char *errStr = smb2_get_error(_context);
+            if (errStr) {
+                desc = [NSString stringWithUTF8String:errStr];
+            }
             smb2_destroy_context(_context);
             _context = NULL;
             if (error) {
-                *error = SMB2POSIXError((int32_t)(-serviceResult), nil);
+                *error = SMB2POSIXError((int32_t)(-serviceResult), desc);
             }
             return NO;
         }
@@ -307,9 +313,11 @@ static void smb2_generic_handler(struct smb2_context *smb2, int status, void *co
         }
 
         if (cb.result != 0) {
-            uint32_t ntStatus = (uint32_t)cb.result;
-            NSError *ntError = SMB2POSIXErrorFromNTStatus(ntStatus);
-            if (ntError && error) *error = ntError;
+            // High-level libsmb2 async functions pass negated POSIX errno (not NT status).
+            NSString *errStr = smb2_get_error(_context)
+                ? [NSString stringWithUTF8String:smb2_get_error(_context)]
+                : nil;
+            if (error) *error = SMB2POSIXErrorFromResult(cb.result, errStr);
             return cb.result;
         }
 
@@ -382,9 +390,10 @@ static void smb2_generic_handler(struct smb2_context *smb2, int status, void *co
 }
 
 - (BOOL)disconnectWithError:(NSError **)error {
+    // Match Swift behavior: swallow disconnect errors (connection may already be gone).
     [self asyncAwait:^int32_t(struct smb2_context *context, void *cbPtr) {
         return smb2_disconnect_share_async(context, smb2_generic_handler, cbPtr);
-    } error:error];
+    } error:nil];
     return YES;
 }
 
@@ -441,6 +450,7 @@ static void smb2_generic_handler(struct smb2_context *smb2, int status, void *co
         return smb2_share_enum_async(context, SHARE_INFO_1, smb2_generic_handler, cbPtr);
     } error:error];
 
+    // smb2_share_enum_async transfers ownership of the decoded reply to the caller.
     if (capturedData && capturedContext) {
         smb2_free_data(capturedContext, capturedData);
     }
