@@ -1,0 +1,27 @@
+PODS:
+  - AMSMB2/ObjC (4.0.3):
+    - libsmb2
+  - libsmb2 (6.1.0)
+
+DEPENDENCIES:
+  - AMSMB2/ObjC (from `../`)
+  - "libsmb2 (from `git@github.com:everappz/libsmb2.git`)"
+
+EXTERNAL SOURCES:
+  AMSMB2:
+    :path: "../"
+  libsmb2:
+    :git: "git@github.com:everappz/libsmb2.git"
+
+CHECKOUT OPTIONS:
+  libsmb2:
+    :commit: 9d6ac0fd8486a19523d88218bbfb49b98ba23582
+    :git: "git@github.com:everappz/libsmb2.git"
+
+SPEC CHECKSUMS:
+  AMSMB2: 2972db99660375af7b8d4cf5be9bd805f6e992cf
+  libsmb2: d071e1e41618156cfaeafb47f8680426e31e900a
+
+PODFILE CHECKSUM: f62e61c882d4f26f443b844ebc129337443aa4e6
+
+COCOAPODS: 1.16.2

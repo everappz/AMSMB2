@@ -9,7 +9,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
     ) -> Bool {
-        let _ = SMB2Manager(
+        let _ = AMSMB2Manager(
             url: URL(string: "smb://127.0.0.1")!,
             credential: URLCredential(user: "test", password: "test", persistence: .none)
         )

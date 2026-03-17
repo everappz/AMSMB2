@@ -5,7 +5,11 @@ target 'PodTests' do
 
   # pod 'libsmb2', :path => 'Submodules/libsmb2'
   # pod 'AMSMB2', :path => 'Submodules/AMSMB2'
-  
+
   pod 'libsmb2', :git => 'git@github.com:everappz/libsmb2.git'
-  pod 'AMSMB2', :git => 'git@github.com:everappz/AMSMB2.git'
+  pod 'AMSMB2/ObjC', :path => '../'
+
+  target 'PodTestsTests' do
+    inherit! :search_paths
+  end
 end
