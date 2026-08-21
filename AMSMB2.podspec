@@ -34,7 +34,7 @@ Pod::Spec.new do |s|
 
   s.subspec 'ObjC' do |ss|
     ss.source_files = 'AMSMB2ObjC/**/*.{h,m}'
-    ss.public_header_files = 'AMSMB2ObjC/AMSMB2Manager.h'
+    ss.public_header_files = 'AMSMB2ObjC/AMSMB2Manager.h', 'AMSMB2ObjC/AMSMB2Server.h'
     ss.private_header_files = 'AMSMB2ObjC/SMB2Client.h', 'AMSMB2ObjC/SMB2FileHandle.h', 'AMSMB2ObjC/SMB2Directory.h', 'AMSMB2ObjC/SMB2Helpers.h'
   end
 end

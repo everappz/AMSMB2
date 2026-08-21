@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		006677D2E03EABEE1F3F080A /* AMSMB2ServerTests.m in Sources */ = {isa = PBXBuildFile; fileRef = 46DF0071526EB21B7DA02A05 /* AMSMB2ServerTests.m */; };
 		6431CC2478B3C3CF5F9415E8 /* Pods_PodTests.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 0B21311170CBF956446DC466 /* Pods_PodTests.framework */; };
 		AA000001 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000002 /* AppDelegate.swift */; };
 		BB000001 /* AMSMB2ManagerTests.m in Sources */ = {isa = PBXBuildFile; fileRef = BB000002 /* AMSMB2ManagerTests.m */; };
@@ -25,6 +26,7 @@
 
 /* Begin PBXFileReference section */
 		0B21311170CBF956446DC466 /* Pods_PodTests.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = Pods_PodTests.framework; sourceTree = BUILT_PRODUCTS_DIR; };
+		46DF0071526EB21B7DA02A05 /* AMSMB2ServerTests.m */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.c.objc; path = AMSMB2ServerTests.m; sourceTree = "<group>"; };
 		4FCC3FCBD7A1A619DA14F7D3 /* Pods-PodTests.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-PodTests.release.xcconfig"; path = "Target Support Files/Pods-PodTests/Pods-PodTests.release.xcconfig"; sourceTree = "<group>"; };
 		7521042A438BA56CC43C8BB5 /* Pods-PodTests.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-PodTests.debug.xcconfig"; path = "Target Support Files/Pods-PodTests/Pods-PodTests.debug.xcconfig"; sourceTree = "<group>"; };
 		AA000002 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
@@ -87,14 +89,6 @@
 			path = PodTests;
 			sourceTree = "<group>";
 		};
-		BB000011 /* PodTestsTests */ = {
-			isa = PBXGroup;
-			children = (
-				BB000002 /* AMSMB2ManagerTests.m */,
-			);
-			path = PodTestsTests;
-			sourceTree = "<group>";
-		};
 		AA000012 /* Products */ = {
 			isa = PBXGroup;
 			children = (
@@ -102,6 +96,15 @@
 				BB000005 /* PodTestsTests.xctest */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		BB000011 /* PodTestsTests */ = {
+			isa = PBXGroup;
+			children = (
+				BB000002 /* AMSMB2ManagerTests.m */,
+				46DF0071526EB21B7DA02A05 /* AMSMB2ServerTests.m */,
+			);
+			path = PodTestsTests;
 			sourceTree = "<group>";
 		};
 		C0832F423F489916ADC9EE91 /* Frameworks */ = {
@@ -259,6 +262,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				BB000001 /* AMSMB2ManagerTests.m in Sources */,
+				006677D2E03EABEE1F3F080A /* AMSMB2ServerTests.m in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -418,20 +422,20 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		BB000030 /* Build configuration list for PBXNativeTarget "PodTestsTests" */ = {
-			isa = XCConfigurationList;
-			buildConfigurations = (
-				BB000052 /* Debug */,
-				BB000053 /* Release */,
-			);
-			defaultConfigurationIsVisible = 0;
-			defaultConfigurationName = Release;
-		};
 		AA000041 /* Build configuration list for PBXProject "PodTests" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				AA000050 /* Debug */,
 				AA000051 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		BB000030 /* Build configuration list for PBXNativeTarget "PodTestsTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				BB000052 /* Debug */,
+				BB000053 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
