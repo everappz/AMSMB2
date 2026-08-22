@@ -41,6 +41,8 @@ clang -fobjc-arc -o "$BUILD/server_bin" \
   -isysroot "$SDK" -framework Foundation -framework Security
 clang -o "$BUILD/client_bin" "$HERE/client_main.c" "$BUILD/libsmb2.a" \
   -I "$LSMB/include" -isysroot "$SDK" -framework Foundation -framework Security
+clang -o "$BUILD/client_tests" "$HERE/client_tests.c" "$BUILD/libsmb2.a" \
+  -I "$LSMB/include" -isysroot "$SDK" -framework Foundation -framework Security
 
 echo "== running server on 127.0.0.1:$PORT =="
 ROOT="$(mktemp -d /tmp/amsmb2-share.XXXXXX)"
@@ -50,5 +52,9 @@ SRVPID=$!
 trap 'kill $SRVPID 2>/dev/null || true; rm -rf "$BUILD" "$ROOT"' EXIT
 for _ in $(seq 1 50); do grep -q "SERVER UP" "$BUILD/server.log" 2>/dev/null && break; sleep 0.1; done
 
-echo "== running client =="
+echo "== smoke test =="
 "$BUILD/client_bin" "127.0.0.1:$PORT"
+
+echo ""
+echo "== comprehensive suite (30 tests) =="
+"$BUILD/client_tests" "127.0.0.1:$PORT"
