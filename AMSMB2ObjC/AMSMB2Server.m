@@ -111,6 +111,33 @@ static uint32_t AMAttributesFromInfo(AMSMB2FileInfo *info)
     return attr;
 }
 
+/// A self-relative SECURITY_DESCRIPTOR granting Everyone (S-1-1-0) full control,
+/// used to answer QUERY_INFO(SECURITY) so clients treat the share as writable.
+/// Layout per MS-DTYP: SD header (20) + Owner SID (12) + Group SID (12) + DACL
+/// with one ACCESS_ALLOWED ACE (28) = 72 bytes.
+static NSData *AMEveryoneFullControlSecurityDescriptor(void)
+{
+    static const uint8_t sd[] = {
+        // SECURITY_DESCRIPTOR (self-relative)
+        0x01, 0x00, 0x04, 0x80,             // Revision, Sbz1, Control = SELF_RELATIVE|DACL_PRESENT
+        0x14, 0x00, 0x00, 0x00,             // OffsetOwner = 20
+        0x20, 0x00, 0x00, 0x00,             // OffsetGroup = 32
+        0x00, 0x00, 0x00, 0x00,             // OffsetSacl  = 0
+        0x2C, 0x00, 0x00, 0x00,             // OffsetDacl  = 44
+        // Owner SID — Everyone (S-1-1-0)
+        0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        // Group SID — Everyone (S-1-1-0)
+        0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        // DACL: ACL header (rev=2, size=28, count=1)
+        0x02, 0x00, 0x1C, 0x00, 0x01, 0x00, 0x00, 0x00,
+        // ACE: ACCESS_ALLOWED, flags=OI|CI, size=20, mask=FILE_ALL_ACCESS (0x001F01FF)
+        0x00, 0x03, 0x14, 0x00, 0xFF, 0x01, 0x1F, 0x00,
+        // ACE SID — Everyone (S-1-1-0)
+        0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+    };
+    return [NSData dataWithBytes:sd length:sizeof(sd)];
+}
+
 /// SMB delivers share-relative paths with backslash separators; normalize to
 /// forward slashes so delegates see conventional POSIX-style paths.
 static NSString *AMPathFromCName(const char *_Nullable cname)
@@ -1256,8 +1283,64 @@ static int am_query_info(struct smb2_server *srvr, struct smb2_context *smb2, st
                     length = sizeof(*fs);
                     break;
                 }
+                case SMB2_FILE_FS_VOLUME_INFORMATION: {
+                    // Provides the volume name Finder shows for the share. The
+                    // encoder reads volume_label as a UTF-8 C string and keeps it
+                    // alive only until this reply is encoded, so pack the label
+                    // into the same allocation and point at it.
+                    NSData *label = [server.shareName dataUsingEncoding:NSUTF8StringEncoding] ?: [NSData data];
+                    struct smb2_file_fs_volume_info *fs = calloc(1, sizeof(*fs) + label.length + 1);
+                    uint8_t *labelBytes = (uint8_t *)fs + sizeof(*fs);
+                    if (label.length) {
+                        memcpy(labelBytes, label.bytes, label.length);
+                    }
+                    fs->creation_time = AMTimevalFromDate([NSDate dateWithTimeIntervalSince1970:0]);
+                    fs->volume_serial_number = 0x414D5342; // "AMSB"
+                    fs->supports_objects = 0;
+                    fs->reserved = 0;
+                    fs->volume_label = labelBytes;
+                    buffer = fs;
+                    length = sizeof(*fs);
+                    break;
+                }
+                case SMB2_FILE_FS_FULL_SIZE_INFORMATION: {
+                    // Free/total space for Finder's capacity bar (~512 MB free).
+                    struct smb2_file_fs_full_size_info *fs = calloc(1, sizeof(*fs));
+                    fs->total_allocation_units = 0x100000;
+                    fs->caller_available_allocation_units = 0x80000;
+                    fs->actual_available_allocation_units = 0x80000;
+                    fs->sectors_per_allocation_unit = 1;
+                    fs->bytes_per_sector = 512;
+                    buffer = fs;
+                    length = sizeof(*fs);
+                    break;
+                }
+                case SMB2_FILE_FS_SECTOR_SIZE_INFORMATION: {
+                    struct smb2_file_fs_sector_size_info *fs = calloc(1, sizeof(*fs));
+                    fs->logical_bytes_per_sector = 512;
+                    fs->physical_bytes_per_sector_for_atomicity = 512;
+                    fs->physical_bytes_per_sector_for_performance = 512;
+                    fs->file_system_effective_physical_bytes_per_sector_for_atomicity = 512;
+                    fs->flags = 0;
+                    fs->byte_offset_for_sector_alignment = 0;
+                    fs->byte_offset_for_partition_alignment = 0;
+                    buffer = fs;
+                    length = sizeof(*fs);
+                    break;
+                }
                 default:
                     break;
+            }
+        } else if (req->info_type == SMB2_0_INFO_SECURITY && server.fullControlEnabled) {
+            // A minimal self-relative security descriptor granting Everyone full
+            // control, so Finder shows the share as writable. Raw bytes are only
+            // shippable in passthrough mode (fullControlEnabled).
+            NSData *sd = AMEveryoneFullControlSecurityDescriptor();
+            void *buf = malloc(sd.length);
+            if (buf) {
+                memcpy(buf, sd.bytes, sd.length);
+                buffer = buf;
+                length = (int)sd.length;
             }
         }
 
