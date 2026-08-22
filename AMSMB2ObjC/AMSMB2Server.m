@@ -979,7 +979,11 @@ static NSData *_Nullable AMBuildDirWire(uint8_t infoClass, NSArray<AMSMB2FileInf
             AMWriteLE64(p + 48, info.isDirectory ? 0 : info.allocationSize);
             AMWriteLE32(p + 56, AMAttributesFromInfo(info));
             AMWriteLE32(p + 60, (uint32_t)nameLen);
-            uint64_t fileId = (uint64_t)(i + 1);
+            // FileId (file reference number) must be 0 unless it is a stable,
+            // per-file identifier; a per-listing index confuses clients' name
+            // caches (macOS maps every lookup to the first entry). Match known-
+            // good servers and leave it 0 (clients then key on the name).
+            uint64_t fileId = 0;
             switch (infoClass) {
                 case SMB2_FILE_DIRECTORY_INFORMATION:
                     if (nameLen) memcpy(p + 64, nameU16.bytes, nameLen);
@@ -1042,6 +1046,17 @@ static int am_query_directory(struct smb2_server *srvr, struct smb2_context *smb
             NSArray<AMSMB2FileInfo *> *children = [delegate server:server enumerateItem:file.handle pattern:pattern error:&err];
             if (!children) {
                 return -1;
+            }
+            // Honor the search pattern. Clients (macOS especially) resolve a
+            // single path by opening the directory and querying with the leaf
+            // name as the pattern; a server that ignores it and returns every
+            // entry makes the client take the first entry as the match — so
+            // every lookup resolves to the wrong file. Filter here (SMB is
+            // case-insensitive; '*' and '?' are wildcards) unless the delegate
+            // already narrowed the result.
+            if (pattern.length && ![pattern isEqualToString:@"*"]) {
+                NSPredicate *pred = [NSPredicate predicateWithFormat:@"name LIKE[c] %@", pattern];
+                children = [children filteredArrayUsingPredicate:pred];
             }
             // Note: "." and ".." are intentionally NOT synthesized — clients
             // (macOS kernel VFS, Windows) provide them, and injecting our own
