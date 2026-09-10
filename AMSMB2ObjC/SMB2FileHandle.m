@@ -63,12 +63,22 @@ typedef struct {
     _client = client;
     NSString *canonical = SMB2CanonicalPath(path);
 
+    // libsmb2 maps O_SYNC to SMB2_FILE_NO_INTERMEDIATE_BUFFERING, which is invalid on directories
+    // per MS-FSCC 2.1.5.1: a CREATE carrying both FILE_DIRECTORY_FILE and FILE_NO_INTERMEDIATE_BUFFERING
+    // is rejected by Windows with STATUS_INVALID_PARAMETER (e.g. a directory CHANGE_NOTIFY open done
+    // with O_RDONLY|O_SYNC). Drop O_SYNC for directory opens here so the combination is never sent.
+    // (The vendored libsmb2 is intentionally left byte-identical to upstream; the guard lives in the wrapper.)
+    int32_t openFlags = flags;
+    if ((openFlags & O_DIRECTORY) != 0) {
+        openFlags &= ~O_SYNC;
+    }
+
     __block struct smb2fh *fh = NULL;
 
     int32_t result = [client asyncAwaitWithDataHandler:^(void *commandData) {
         fh = (struct smb2fh *)commandData;
     } execute:^int32_t(struct smb2_context *context, void *cbPtr) {
-        return smb2_open_async(context, [canonical UTF8String], flags,
+        return smb2_open_async(context, [canonical UTF8String], openFlags,
                                [SMB2Client genericHandler], cbPtr);
     } error:error];
 
