@@ -259,6 +259,11 @@ createSymbolicLinkAtItem:(id)handle
 @property (nonatomic) BOOL allowsAnonymousAccess;
 /// Whether SMB signing is offered/required. Default `YES`.
 @property (nonatomic) BOOL signingEnabled;
+/// When `YES` the server REQUIRES SMB3 encryption (seal) on every PDU after
+/// session setup. Needs an authenticated (non-anonymous) session and a
+/// negotiated 3.x dialect, so it cannot be combined with anonymous access.
+/// Default `NO`.
+@property (nonatomic) BOOL encryptionEnabled;
 /// Enables write-side mutation via SMB2 SET_INFO: **rename**, delete-by-
 /// disposition, truncate (SetEndOfFile) and timestamp/attribute updates.
 ///

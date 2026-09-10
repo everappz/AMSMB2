@@ -248,9 +248,19 @@ int main(int argc, char **argv)
         FSDelegate *d = [FSDelegate new];
         d.root = root;
         AMSMB2Server *srv = [[AMSMB2Server alloc] initWithPort:port shareName:@"Share" delegate:d];
-        srv.allowsAnonymousAccess = YES;
         srv.fullControlEnabled = (argc > 3 ? atoi(argv[3]) != 0 : YES);
         srv.signingEnabled = (argc > 4 ? atoi(argv[4]) != 0 : YES);
+        // Optional argv[5]=user argv[6]=password: when set, require auth (needed to exercise SMB
+        // signing/encryption, which derive keys from the authenticated session). Else anonymous.
+        if (argc > 6 && argv[5][0]) {
+            srv.username = @(argv[5]);
+            srv.password = @(argv[6]);
+            srv.allowsAnonymousAccess = NO;
+        } else {
+            srv.allowsAnonymousAccess = YES;
+        }
+        // Optional argv[7]=encryption: require SMB3 seal on every PDU (needs auth above).
+        srv.encryptionEnabled = (argc > 7 ? atoi(argv[7]) != 0 : NO);
         NSError *err = nil;
         if (![srv startAndReturnError:&err]) {
             fprintf(stderr, "SERVER START FAILED: %s\n", err.description.UTF8String);

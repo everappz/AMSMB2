@@ -380,6 +380,7 @@ static void am_on_error(struct smb2_context *smb2, const char *error_string);
     _server.handlers = &_handlers;
     _server.port = _port;
     _server.signing_enabled = _signingEnabled ? 1 : 0;
+    _server.encryption_enabled = _encryptionEnabled ? 1 : 0;
     _server.allow_anonymous = _allowsAnonymousAccess ? 1 : 0;
     _server.auth_data = (__bridge void *)self;
     if (_hostName.length > 0) {

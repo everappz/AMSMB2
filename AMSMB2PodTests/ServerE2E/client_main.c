@@ -20,10 +20,26 @@ int main(int argc, char **argv)
     struct smb2_context *smb2 = smb2_init_context();
     if (!smb2) { printf("no context\n"); return 2; }
 
-    smb2_set_security_mode(smb2, SMB2_NEGOTIATE_SIGNING_ENABLED);
+    {
+        const char *sg = getenv("SMB_SIGNING");
+        smb2_set_security_mode(smb2, (sg && !strcmp(sg, "required"))
+                               ? SMB2_NEGOTIATE_SIGNING_REQUIRED
+                               : SMB2_NEGOTIATE_SIGNING_ENABLED);
+    }
+    {
+        /* SMB_ENCRYPTED=1 forces SMB3 seal; needs a 3.x dialect, so pin ANY3. */
+        const char *enc = getenv("SMB_ENCRYPTED");
+        if (enc && enc[0] == '1') {
+            smb2_set_version(smb2, SMB2_VERSION_ANY3);
+            smb2_set_seal(smb2, 1);
+        }
+    }
+
+    const char *envUser = getenv("SMB_USER"), *envPass = getenv("SMB_PASSWORD");
+    if (envPass && envPass[0]) smb2_set_password(smb2, envPass);
 
     printf("[connect] %s\n", hostport);
-    int rc = smb2_connect_share(smb2, hostport, "Share", "");
+    int rc = smb2_connect_share(smb2, hostport, "Share", (envUser && envUser[0]) ? envUser : "");
     if (rc) { printf("  FAIL: connect (%s)\n", smb2_get_error(smb2)); return 1; }
     printf("  PASS: connect\n");
 

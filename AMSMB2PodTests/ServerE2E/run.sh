@@ -51,8 +51,24 @@ ROOT="$(mktemp -d /tmp/amsmb2-share.XXXXXX)"
 echo "seed" > "$ROOT/readme.txt"
 "$BUILD/server_bin" "$ROOT" "$PORT" 1 1 > "$BUILD/server.log" 2>&1 &
 SRVPID=$!
-trap 'kill $SRVPID 2>/dev/null || true; rm -rf "$BUILD" "$ROOT"' EXIT
+# Second server: authenticated (creds) + signing, so SMB signing can be exercised (signing needs a
+# session key, which anonymous sessions don't have).
+PORT2=$((PORT + 1))
+ROOT2="$(mktemp -d /tmp/amsmb2-share.XXXXXX)"
+echo "seed" > "$ROOT2/readme.txt"
+SMB_TEST_USER="smbtester"; SMB_TEST_PASS="Passw0rd!"
+"$BUILD/server_bin" "$ROOT2" "$PORT2" 1 1 "$SMB_TEST_USER" "$SMB_TEST_PASS" > "$BUILD/server2.log" 2>&1 &
+SRVPID2=$!
+# Third server: authenticated + SMB3 encryption required (argv[7]=1), so seal can be exercised.
+PORT3=$((PORT + 2))
+ROOT3="$(mktemp -d /tmp/amsmb2-share.XXXXXX)"
+echo "seed" > "$ROOT3/readme.txt"
+"$BUILD/server_bin" "$ROOT3" "$PORT3" 1 1 "$SMB_TEST_USER" "$SMB_TEST_PASS" 1 > "$BUILD/server3.log" 2>&1 &
+SRVPID3=$!
+trap 'kill $SRVPID $SRVPID2 $SRVPID3 2>/dev/null || true; rm -rf "$BUILD" "$ROOT" "$ROOT2" "$ROOT3"' EXIT
 for _ in $(seq 1 50); do grep -q "SERVER UP" "$BUILD/server.log" 2>/dev/null && break; sleep 0.1; done
+for _ in $(seq 1 50); do grep -q "SERVER UP" "$BUILD/server2.log" 2>/dev/null && break; sleep 0.1; done
+for _ in $(seq 1 50); do grep -q "SERVER UP" "$BUILD/server3.log" 2>/dev/null && break; sleep 0.1; done
 
 echo "== smoke test =="
 "$BUILD/client_bin" "127.0.0.1:$PORT"
@@ -64,3 +80,17 @@ echo "== comprehensive suite (30 tests) =="
 echo ""
 echo "== share enumeration (srvsvc NetrShareEnum) =="
 "$BUILD/client_shareenum" "127.0.0.1:$PORT"
+
+echo ""
+echo "== signed pass: authenticated client REQUIRES SMB signing (server signing_enabled=1) =="
+SMB_USER="$SMB_TEST_USER" SMB_PASSWORD="$SMB_TEST_PASS" SMB_SIGNING=required "$BUILD/client_bin" "127.0.0.1:$PORT2"
+echo ""
+echo "== signed comprehensive suite (30 tests, every PDU signed + verified) =="
+SMB_USER="$SMB_TEST_USER" SMB_PASSWORD="$SMB_TEST_PASS" SMB_SIGNING=required "$BUILD/client_tests" "127.0.0.1:$PORT2"
+
+echo ""
+echo "== encrypted pass: authenticated client REQUIRES SMB3 seal (server encryption_enabled=1) =="
+SMB_USER="$SMB_TEST_USER" SMB_PASSWORD="$SMB_TEST_PASS" SMB_ENCRYPTED=1 "$BUILD/client_bin" "127.0.0.1:$PORT3"
+echo ""
+echo "== encrypted comprehensive suite (30 tests, every PDU AES-CCM sealed) =="
+SMB_USER="$SMB_TEST_USER" SMB_PASSWORD="$SMB_TEST_PASS" SMB_ENCRYPTED=1 "$BUILD/client_tests" "127.0.0.1:$PORT3"

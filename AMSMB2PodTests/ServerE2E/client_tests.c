@@ -428,10 +428,27 @@ int main(int argc, char **argv)
     const char *hostport = argc > 1 ? argv[1] : "127.0.0.1:8445";
     struct smb2_context *smb2 = smb2_init_context();
     if (!smb2) { printf("no context\n"); return 2; }
-    smb2_set_security_mode(smb2, SMB2_NEGOTIATE_SIGNING_ENABLED);
-    if (smb2_connect_share(smb2, hostport, "Share", "") != 0) {
-        printf("CONNECT FAILED: %s\n", smb2_get_error(smb2));
-        return 1;
+    {
+        const char *sg = getenv("SMB_SIGNING");
+        smb2_set_security_mode(smb2, (sg && !strcmp(sg, "required"))
+                               ? SMB2_NEGOTIATE_SIGNING_REQUIRED
+                               : SMB2_NEGOTIATE_SIGNING_ENABLED);
+    }
+    {
+        /* SMB_ENCRYPTED=1 forces SMB3 seal; needs a 3.x dialect, so pin ANY3. */
+        const char *enc = getenv("SMB_ENCRYPTED");
+        if (enc && enc[0] == '1') {
+            smb2_set_version(smb2, SMB2_VERSION_ANY3);
+            smb2_set_seal(smb2, 1);
+        }
+    }
+    {
+        const char *u = getenv("SMB_USER"), *p = getenv("SMB_PASSWORD");
+        if (p && p[0]) smb2_set_password(smb2, p);
+        if (smb2_connect_share(smb2, hostport, "Share", (u && u[0]) ? u : "") != 0) {
+            printf("CONNECT FAILED: %s\n", smb2_get_error(smb2));
+            return 1;
+        }
     }
     printf("connected to %s\n\n", hostport);
 
