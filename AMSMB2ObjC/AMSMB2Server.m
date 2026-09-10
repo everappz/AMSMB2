@@ -19,6 +19,8 @@
 #include <smb2/libsmb2.h>
 #include <smb2/libsmb2-raw.h>
 #include <smb2/smb2-errors.h>
+#include <smb2/libsmb2-dcerpc.h>
+#include <smb2/libsmb2-dcerpc-srvsvc.h>
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -30,6 +32,15 @@
 
 #define AM_PAD_TO_64BIT(len) (((len) + 0x07) & ~0x07)
 #define AM_PAD_TO_32BIT(len) (((len) + 0x03) & ~0x03)
+
+// DEBUG-only trace for the SMB server C core (share enumeration / named-pipe RPC and the
+// tree/create/read/write/ioctl plumbing). Prefixed [SMB-SRV] so it filters cleanly in Console
+// alongside the app-side [SMB] (controller) and [SMB-FS] (delegate) traces. Compiled out of release.
+#if DEBUG
+#define SMBSrvLog(fmt, ...) NSLog((@"[SMB-SRV] " fmt), ##__VA_ARGS__)
+#else
+#define SMBSrvLog(fmt, ...) do {} while (0)
+#endif
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -92,6 +103,39 @@ static void AMWriteLE64(uint8_t *p, uint64_t v)
     AMWriteLE32(p, (uint32_t)(v & 0xffffffffULL));
     AMWriteLE32(p + 4, (uint32_t)((v >> 32) & 0xffffffffULL));
 }
+
+static uint16_t AMReadLE16(const uint8_t *p)
+{
+    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+
+static void AMAppendLE16(NSMutableData *d, uint16_t v)
+{
+    uint8_t b[2] = { (uint8_t)(v & 0xff), (uint8_t)((v >> 8) & 0xff) };
+    [d appendBytes:b length:2];
+}
+
+static void AMAppendLE32(NSMutableData *d, uint32_t v)
+{
+    uint8_t b[4];
+    AMWriteLE32(b, v);
+    [d appendBytes:b length:4];
+}
+
+#if DEBUG
+// Compact hex preview of a buffer (first `max` bytes) for the [SMB-SRV] pipe traces, so each
+// on-device round shows exactly what bytes we received / emitted.
+static NSString *AMHexPreview(NSData *data, NSUInteger max)
+{
+    if (data.length == 0) { return @"<empty>"; }
+    NSUInteger n = MIN(data.length, max);
+    const uint8_t *b = data.bytes;
+    NSMutableString *s = [NSMutableString stringWithCapacity:n * 3];
+    for (NSUInteger i = 0; i < n; i++) { [s appendFormat:@"%02x ", b[i]]; }
+    if (n < data.length) { [s appendFormat:@"... (%lu bytes)", (unsigned long)data.length]; }
+    return s;
+}
+#endif
 
 static uint32_t AMAttributesFromInfo(AMSMB2FileInfo *info)
 {
@@ -182,6 +226,12 @@ static NSString *AMPathFromCName(const char *_Nullable cname)
 @property (nonatomic, nullable, strong) NSArray<AMSMB2FileInfo *> *dirEntries;
 @property (nonatomic) NSUInteger dirCursor;
 @property (nonatomic) BOOL dirEnumerated;
+// Named-pipe (MS-RPC) state: a CREATE of `srvsvc` (etc.) on IPC$ opens a virtual DCE/RPC pipe
+// instead of a delegate file. `pipeReadBuffer` holds the response bytes produced by a
+// TRANSCEIVE/WRITE until the client READs them (the write-then-read pipe path).
+@property (nonatomic) BOOL isPipe;
+@property (nonatomic, nullable, copy) NSString *pipeName;
+@property (nonatomic, nullable, strong) NSMutableData *pipeReadBuffer;
 @end
 
 @implementation AMSMB2ServerOpenFile
@@ -550,6 +600,256 @@ static int am_logoff(struct smb2_server *srvr, struct smb2_context *smb2)
     return 0;
 }
 
+#pragma mark - Named-pipe MS-RPC responder (srvsvc share enumeration)
+
+// DCE/RPC PDU types we care about (MS-RPCE 2.2.2.13).
+#define AM_DCERPC_PT_REQUEST        0x00
+#define AM_DCERPC_PT_RESPONSE       0x02
+#define AM_DCERPC_PT_FAULT          0x03
+#define AM_DCERPC_PT_BIND           0x0b
+#define AM_DCERPC_PT_BIND_ACK       0x0c
+#define AM_DCERPC_PT_ALTER_CONTEXT  0x0e
+#define AM_DCERPC_PT_ALTER_CTX_RESP 0x0f
+
+/// If `path` names a known MS-RPC endpoint served over a named pipe, returns the lowercased pipe
+/// name; otherwise nil. Detection is by NAME (leading separators stripped): the CREATE handler has
+/// no tree id, so this is how a `\\server\IPC$\srvsvc` open is told apart from a disk-share file.
+static NSString *_Nullable AMNamedPipeNameFromPath(NSString *path)
+{
+    NSString *p = path ?: @"";
+    while ([p hasPrefix:@"/"] || [p hasPrefix:@"\\"]) {
+        p = [p substringFromIndex:1];
+    }
+    NSString *lower = p.lowercaseString;
+    if ([lower isEqualToString:@"srvsvc"] || [lower isEqualToString:@"wkssvc"] ||
+        [lower isEqualToString:@"lsarpc"] || [lower isEqualToString:@"winreg"] ||
+        [lower isEqualToString:@"samr"]  || [lower isEqualToString:@"spoolss"]) {
+        return lower;
+    }
+    return nil;
+}
+
+/// Build a DCE/RPC BIND_ACK (or ALTER_CONTEXT_RESP) responding to `bind`. We accept a single
+/// presentation context using the NDR32 transfer syntax (what macOS/Windows propose for srvsvc),
+/// echoing the client's max frag sizes + association group.
+static NSData *AMBuildBindAck(NSData *bind, uint32_t callId, BOOL alterContext)
+{
+    const uint8_t *b = bind.bytes;
+    NSInteger len = (NSInteger)bind.length;
+
+    uint16_t maxXmit = (len >= 18) ? AMReadLE16(b + 16) : 4280;
+    uint16_t maxRecv = (len >= 20) ? AMReadLE16(b + 18) : 4280;
+    uint32_t assoc   = (len >= 24) ? AMReadLE32(b + 20) : 0;
+    if (assoc == 0) { assoc = 0x00001063; } // Windows returns a non-zero group id.
+
+    NSMutableData *d = [NSMutableData data];
+    uint8_t hdr[16] = { 5, 0, (uint8_t)(alterContext ? AM_DCERPC_PT_ALTER_CTX_RESP : AM_DCERPC_PT_BIND_ACK),
+                        0x03 /* FIRST|LAST */, 0x10, 0, 0, 0, /* drep = little-endian */
+                        0, 0 /* frag_length, fixed up */, 0, 0 /* auth_length */, 0, 0, 0, 0 /* call_id */ };
+    AMWriteLE32(hdr + 12, callId);
+    [d appendBytes:hdr length:16];
+
+    AMAppendLE16(d, maxXmit);
+    AMAppendLE16(d, maxRecv);
+    AMAppendLE32(d, assoc);
+
+    // Secondary address: the pipe name, NUL-terminated ASCII (MS-RPCE 2.2.2.11).
+    const char *sec = "\\PIPE\\srvsvc";
+    uint16_t secLen = (uint16_t)(strlen(sec) + 1);
+    AMAppendLE16(d, secLen);
+    [d appendBytes:sec length:secLen];
+    // Pad to a 4-byte boundary (relative to the PDU start) before the results list.
+    while (d.length & 0x3) { uint8_t z = 0; [d appendBytes:&z length:1]; }
+
+    // p_result_list: num_results(1) + 3 reserved.
+    uint8_t nr = 1, zero = 0;
+    [d appendBytes:&nr length:1];
+    [d appendBytes:&zero length:1];
+    [d appendBytes:&zero length:1];
+    [d appendBytes:&zero length:1];
+
+    // result[0]: ack_result=acceptance(0), ack_reason=0, transfer syntax = NDR32 v2.
+    AMAppendLE16(d, 0);
+    AMAppendLE16(d, 0);
+    static const uint8_t ndr32[16] = { 0x04, 0x5d, 0x88, 0x8a, 0xeb, 0x1c, 0xc9, 0x11,
+                                       0x9f, 0xe8, 0x08, 0x00, 0x2b, 0x10, 0x48, 0x60 };
+    [d appendBytes:ndr32 length:16];
+    AMAppendLE32(d, 2);
+
+    uint8_t *m = (uint8_t *)d.mutableBytes;
+    uint16_t frag = (uint16_t)d.length;
+    m[8] = (uint8_t)(frag & 0xff);
+    m[9] = (uint8_t)((frag >> 8) & 0xff);
+    return d;
+}
+
+/// Build a DCE/RPC FAULT PDU (for an opnum we do not implement) so the client fails cleanly instead
+/// of hanging waiting for a reply.
+static NSData *AMBuildFault(uint32_t callId, uint16_t contextId, uint32_t status)
+{
+    NSMutableData *d = [NSMutableData data];
+    uint8_t hdr[16] = { 5, 0, AM_DCERPC_PT_FAULT, 0x03, 0x10, 0, 0, 0,
+                        0, 0, 0, 0, 0, 0, 0, 0 };
+    AMWriteLE32(hdr + 12, callId);
+    [d appendBytes:hdr length:16];
+    AMAppendLE32(d, 0);          // alloc_hint
+    AMAppendLE16(d, contextId);  // p_cont_id
+    uint8_t cc = 0, fl = 0;
+    [d appendBytes:&cc length:1]; // cancel_count
+    [d appendBytes:&fl length:1]; // reserved
+    AMAppendLE32(d, status);     // status
+    AMAppendLE32(d, 0);          // reserved
+    uint8_t *m = (uint8_t *)d.mutableBytes;
+    uint16_t frag = (uint16_t)d.length;
+    m[8] = (uint8_t)(frag & 0xff);
+    m[9] = (uint8_t)((frag >> 8) & 0xff);
+    return d;
+}
+
+/// Build the NetrShareEnum (opnum 0x0f) level-1 response: the single disk share plus IPC$.
+static NSData *_Nullable AMBuildShareEnumResponse(AMSMB2Server *server, struct dcerpc_context *dce,
+                                                  uint32_t callId, uint16_t contextId)
+{
+    NSString *shareName = server.shareName.length ? server.shareName : @"Share";
+    const char *shareNameC = shareName.UTF8String; // valid for the synchronous encode below
+
+    struct srvsvc_SHARE_INFO_1 shares[2];
+    memset(shares, 0, sizeof(shares));
+    shares[0].netname.utf8 = shareNameC;
+    shares[0].type = SHARE_TYPE_DISKTREE;
+    shares[0].remark.utf8 = "";
+    shares[1].netname.utf8 = "IPC$";
+    shares[1].type = SHARE_TYPE_IPC | SHARE_TYPE_HIDDEN;
+    shares[1].remark.utf8 = "Remote IPC";
+
+    struct srvsvc_SHARE_INFO_1_carray arr;
+    memset(&arr, 0, sizeof(arr));
+    arr.max_count = 2;
+    arr.share_info_1 = shares;
+
+    struct srvsvc_SHARE_INFO_1_CONTAINER ctr;
+    memset(&ctr, 0, sizeof(ctr));
+    ctr.EntriesRead = 2;
+    ctr.Buffer = &arr;
+
+    struct srvsvc_NetrShareEnum_rep rep;
+    memset(&rep, 0, sizeof(rep));
+    rep.ses.Level = 1;
+    rep.ses.ShareInfo.Level = 1;
+    rep.ses.ShareInfo.Level1 = ctr;
+    rep.total_entries = 2;
+    rep.resume_handle = 0;
+    rep.status = 0;
+
+    uint8_t buf[16384];
+    int n = dcerpc_server_build_response(dce, callId, contextId,
+                                         srvsvc_NetrShareEnum_rep_coder, &rep,
+                                         buf, (int)sizeof(buf));
+    if (n <= 0) {
+        SMBSrvLog(@"NetrShareEnum encode FAILED (n=%d)", n);
+        return nil;
+    }
+    return [NSData dataWithBytes:buf length:(NSUInteger)n];
+}
+
+/// Build the NetrShareGetInfo (opnum 0x10) level-1 response for the disk share.
+static NSData *_Nullable AMBuildShareGetInfoResponse(AMSMB2Server *server, struct dcerpc_context *dce,
+                                                     uint32_t callId, uint16_t contextId)
+{
+    NSString *shareName = server.shareName.length ? server.shareName : @"Share";
+    const char *shareNameC = shareName.UTF8String;
+
+    struct srvsvc_NetrShareGetInfo_rep rep;
+    memset(&rep, 0, sizeof(rep));
+    rep.InfoStruct.level = 1;
+    rep.InfoStruct.ShareInfo1.netname.utf8 = shareNameC;
+    rep.InfoStruct.ShareInfo1.type = SHARE_TYPE_DISKTREE;
+    rep.InfoStruct.ShareInfo1.remark.utf8 = "";
+    rep.status = 0;
+
+    uint8_t buf[8192];
+    int n = dcerpc_server_build_response(dce, callId, contextId,
+                                         srvsvc_NetrShareGetInfo_rep_coder, &rep,
+                                         buf, (int)sizeof(buf));
+    if (n <= 0) {
+        SMBSrvLog(@"NetrShareGetInfo encode FAILED (n=%d)", n);
+        return nil;
+    }
+    return [NSData dataWithBytes:buf length:(NSUInteger)n];
+}
+
+/// Turn one inbound DCE/RPC pipe PDU into the response bytes (or nil to fail the op). Handles BIND /
+/// ALTER_CONTEXT and REQUEST (srvsvc NetrShareEnum / NetrShareGetInfo). Everything else -> FAULT.
+static NSData *_Nullable AMHandlePipeInput(AMSMB2Server *server, struct smb2_context *smb2,
+                                           AMSMB2ServerOpenFile *file, NSData *input)
+{
+    const uint8_t *b = input.bytes;
+    NSInteger len = (NSInteger)input.length;
+    if (len < 16) {
+        SMBSrvLog(@"pipe '%@' input too short (%ld bytes)", file.pipeName, (long)len);
+        return nil;
+    }
+
+    uint8_t rpcVers = b[0];
+    uint8_t ptype   = b[2];
+    uint8_t drep0   = b[4];
+    uint32_t callId = AMReadLE32(b + 12);
+#if DEBUG
+    SMBSrvLog(@"pipe '%@' <- ptype=%u vers=%u drep=0x%02x call_id=%u len=%ld | %@",
+              file.pipeName, ptype, rpcVers, drep0, callId, (long)len, AMHexPreview(input, 64));
+#endif
+    if (rpcVers != 5) {
+        SMBSrvLog(@"pipe '%@' unexpected rpc_vers=%u", file.pipeName, rpcVers);
+    }
+    if ((drep0 & 0x10) == 0) {
+        SMBSrvLog(@"pipe '%@' WARNING big-endian NDR not supported (drep=0x%02x)", file.pipeName, drep0);
+    }
+
+    NSData *out = nil;
+
+    if (ptype == AM_DCERPC_PT_BIND || ptype == AM_DCERPC_PT_ALTER_CONTEXT) {
+        out = AMBuildBindAck(input, callId, ptype == AM_DCERPC_PT_ALTER_CONTEXT);
+        SMBSrvLog(@"pipe '%@' -> %@ (%lu bytes)", file.pipeName,
+                  ptype == AM_DCERPC_PT_ALTER_CONTEXT ? @"ALTER_CTX_RESP" : @"BIND_ACK",
+                  (unsigned long)out.length);
+    } else if (ptype == AM_DCERPC_PT_REQUEST) {
+        if (len < 24) {
+            SMBSrvLog(@"pipe '%@' REQUEST too short (%ld)", file.pipeName, (long)len);
+            return nil;
+        }
+        uint16_t contextId = AMReadLE16(b + 20);
+        uint16_t opnum     = AMReadLE16(b + 22);
+        SMBSrvLog(@"pipe '%@' REQUEST opnum=0x%02x context_id=%u", file.pipeName, opnum, contextId);
+
+        struct dcerpc_context *dce = dcerpc_create_context(smb2);
+        if (!dce) {
+            SMBSrvLog(@"pipe '%@' dcerpc_create_context failed", file.pipeName);
+            return nil;
+        }
+        if (opnum == SRVSVC_NETRSHAREENUM) {
+            out = AMBuildShareEnumResponse(server, dce, callId, contextId);
+        } else if (opnum == SRVSVC_NETRSHAREGETINFO) {
+            out = AMBuildShareGetInfoResponse(server, dce, callId, contextId);
+        } else {
+            SMBSrvLog(@"pipe '%@' unsupported opnum 0x%02x -> FAULT", file.pipeName, opnum);
+            out = AMBuildFault(callId, contextId, 0x1C010002 /* nca_op_rng_error */);
+        }
+        dcerpc_destroy_context(dce);
+        if (out) {
+            SMBSrvLog(@"pipe '%@' -> RESPONSE opnum=0x%02x (%lu bytes)",
+                      file.pipeName, opnum, (unsigned long)out.length);
+        }
+    } else {
+        SMBSrvLog(@"pipe '%@' ignoring ptype=%u", file.pipeName, ptype);
+        return nil;
+    }
+
+#if DEBUG
+    if (out) { SMBSrvLog(@"pipe '%@' -> bytes: %@", file.pipeName, AMHexPreview(out, 96)); }
+#endif
+    return out;
+}
+
 #pragma mark - C handlers: tree
 
 static int am_tree_connect(struct smb2_server *srvr, struct smb2_context *smb2, struct smb2_tree_connect_request *req, struct smb2_tree_connect_reply *rep)
@@ -571,6 +871,18 @@ static int am_tree_connect(struct smb2_server *srvr, struct smb2_context *smb2, 
             }
         }
 
+        // IPC$ is the RPC endpoint tree (share enumeration via the srvsvc named pipe). It is not a
+        // delegate-backed disk share, so answer it here as a PIPE tree without gating on the app's
+        // connectToShare: (which only knows about the real disk share).
+        if ([shareName caseInsensitiveCompare:@"IPC$"] == NSOrderedSame) {
+            SMBSrvLog(@"tree_connect IPC$ -> SHARE_TYPE_PIPE");
+            rep->share_type = SMB2_SHARE_TYPE_PIPE;
+            rep->maximal_access = 0x001f00a9; // read/list/execute
+            rep->share_flags = 0;
+            rep->capabilities = 0;
+            return 0;
+        }
+
         id<AMSMB2ServerDelegate> delegate = server.delegate;
         if ([delegate respondsToSelector:@selector(server:connectToShare:)]) {
             if (![delegate server:server connectToShare:shareName]) {
@@ -578,6 +890,7 @@ static int am_tree_connect(struct smb2_server *srvr, struct smb2_context *smb2, 
             }
         }
 
+        SMBSrvLog(@"tree_connect '%@' -> SHARE_TYPE_DISK", shareName);
         rep->share_type = SMB2_SHARE_TYPE_DISK;
         rep->maximal_access = 0x001f01ff; // full access
         rep->share_flags = 0;
@@ -604,6 +917,46 @@ static int am_create(struct smb2_server *srvr, struct smb2_context *smb2, struct
         AMSMB2ServerConnection *conn = [server connectionForContext:smb2 create:YES];
 
         NSString *path = AMPathFromCName(req->name);
+
+        // A CREATE of a known RPC endpoint name (srvsvc, ...) is a named-pipe open on IPC$, NOT a
+        // delegate file. Intercept it here so it is not forwarded to the app delegate (which would
+        // try to open a real file called "srvsvc" and fail with ENOENT, blocking share browsing).
+        NSString *pipeName = AMNamedPipeNameFromPath(path);
+        if (pipeName) {
+            AMSMB2ServerOpenFile *pfile = [[AMSMB2ServerOpenFile alloc] init];
+            pfile.isPipe = YES;
+            pfile.pipeName = pipeName;
+            pfile.path = path;
+            pfile.pipeReadBuffer = [NSMutableData data];
+            pfile.info = [AMSMB2FileInfo fileInfoWithName:pipeName isDirectory:NO size:0];
+
+            NSData *pipeId = nil;
+            {
+                uint8_t idbuf[SMB2_FD_SIZE];
+                memset(idbuf, 0, sizeof(idbuf));
+                uint64_t n = ++conn->_counter;
+                memcpy(idbuf, &n, sizeof(n));
+                memcpy(idbuf + 8, &conn->_salt, sizeof(conn->_salt));
+                pipeId = [NSData dataWithBytes:idbuf length:SMB2_FD_SIZE];
+            }
+            conn.openFiles[pipeId] = pfile;
+            conn.lastFileId = pipeId;
+
+            // The generic IOCTL/READ reply encoders only ship raw output when the context is in
+            // passthrough mode. On a read-only share passthrough is otherwise off, so enable it for
+            // the pipe's lifetime (restored when the pipe closes) or share enumeration silently
+            // returns nothing.
+            smb2_set_passthrough(smb2, 1);
+
+            memset(rep, 0, sizeof(*rep));
+            rep->oplock_level = SMB2_OPLOCK_LEVEL_NONE;
+            rep->create_action = 1; // FILE_OPENED
+            rep->file_attributes = SMB2_FILE_ATTRIBUTE_NORMAL;
+            memcpy(rep->file_id, pipeId.bytes, SMB2_FD_SIZE);
+            SMBSrvLog(@"create pipe '%@' -> file opened (passthrough on)", pipeName);
+            return 0;
+        }
+
         AMSMB2FileInfo *info = nil;
         NSError *err = nil;
         id handle = [delegate server:server
@@ -666,6 +1019,13 @@ static int am_close(struct smb2_server *srvr, struct smb2_context *smb2, struct 
         memset(rep, 0, sizeof(*rep));
 
         if (file) {
+            if (file.isPipe) {
+                // Restore the context's passthrough state to the server default now the pipe is
+                // done (it was forced on in am_create so the RPC reply could be shipped).
+                smb2_set_passthrough(smb2, server.fullControlEnabled ? 1 : 0);
+                SMBSrvLog(@"close pipe '%@' (passthrough restored to %@)",
+                          file.pipeName, server.fullControlEnabled ? @"on" : @"off");
+            }
             if (file.deleteOnClose && [delegate respondsToSelector:@selector(server:deleteItem:error:)]) {
                 NSError *err = nil;
                 [delegate server:server deleteItem:file.handle error:&err];
@@ -719,6 +1079,31 @@ static int am_read(struct smb2_server *srvr, struct smb2_context *smb2, struct s
             return -1;
         }
 
+        // Named-pipe READ: hand back the response bytes produced by the preceding TRANSCEIVE/WRITE
+        // (the write-then-read RPC path some clients use instead of a single IOCTL).
+        if (file.isPipe) {
+            NSData *pending = file.pipeReadBuffer ?: [NSData data];
+            uint32_t n = (uint32_t)MIN((NSUInteger)req->length, pending.length);
+            rep->data_offset = 0;
+            rep->data_remaining = 0;
+            rep->data_length = n;
+            if (n > 0) {
+                rep->data = malloc(n);
+                if (!rep->data) { return -1; }
+                memcpy(rep->data, pending.bytes, n);
+            } else {
+                rep->data = NULL;
+            }
+            if (n < pending.length) {
+                file.pipeReadBuffer = [[pending subdataWithRange:NSMakeRange(n, pending.length - n)] mutableCopy];
+            } else {
+                file.pipeReadBuffer = [NSMutableData data];
+            }
+            SMBSrvLog(@"pipe '%@' READ -> %u bytes (%lu remaining)",
+                      file.pipeName, n, (unsigned long)file.pipeReadBuffer.length);
+            return 0;
+        }
+
         NSError *err = nil;
         NSData *data = [delegate server:server readFromItem:file.handle offset:req->offset length:req->length error:&err];
         if (!data) {
@@ -753,6 +1138,19 @@ static int am_write(struct smb2_server *srvr, struct smb2_context *smb2, struct 
             return -1;
         }
 
+        // Named-pipe WRITE: the client is sending a DCE/RPC request; process it now and stash the
+        // response for the follow-up READ. Report the whole request as written.
+        if (file.isPipe) {
+            NSData *input = [NSData dataWithBytesNoCopy:(void *)req->buf length:req->length freeWhenDone:NO];
+            NSData *output = AMHandlePipeInput(server, smb2, file, input);
+            file.pipeReadBuffer = output ? [output mutableCopy] : [NSMutableData data];
+            rep->count = req->length;
+            rep->remaining = 0;
+            SMBSrvLog(@"pipe '%@' WRITE %u bytes -> %lu response queued",
+                      file.pipeName, req->length, (unsigned long)file.pipeReadBuffer.length);
+            return 0;
+        }
+
         NSData *data = [NSData dataWithBytesNoCopy:(void *)req->buf length:req->length freeWhenDone:NO];
         NSError *err = nil;
         NSInteger written = [delegate server:server writeToItem:file.handle offset:req->offset data:data error:&err];
@@ -782,6 +1180,30 @@ static int am_ioctl(struct smb2_server *srvr, struct smb2_context *smb2, struct 
 {
     @autoreleasepool {
         AMSMB2Server *server = AMServerFromContext(srvr);
+
+        // Named-pipe RPC transceive (Finder's share enumeration): input is a DCE/RPC PDU, output is
+        // our response. Handled REGARDLESS of fullControlEnabled so read-only share browsing works.
+        if (req->ctl_code == SMB2_FSCTL_PIPE_TRANSCEIVE) {
+            AMSMB2ServerConnection *pconn = [server connectionForContext:smb2 create:NO];
+            AMSMB2ServerOpenFile *pfile = AMFileForId(pconn, req->file_id);
+            if (!pfile || !pfile.isPipe) {
+                SMBSrvLog(@"ioctl PIPE_TRANSCEIVE on non-pipe handle -> reject");
+                return -1;
+            }
+            NSData *input = [NSData dataWithBytesNoCopy:(void *)req->input length:req->input_count freeWhenDone:NO];
+            NSData *output = AMHandlePipeInput(server, smb2, pfile, input);
+            if (!output) {
+                return -1;
+            }
+            memset(rep, 0, sizeof(*rep));
+            rep->ctl_code = req->ctl_code;
+            memcpy(rep->file_id, req->file_id, SMB2_FD_SIZE);
+            pconn.pendingIoctlData = output; // keep the bytes alive until libsmb2 encodes the reply
+            rep->output = (void *)output.bytes;
+            rep->output_count = (uint32_t)output.length;
+            return 0;
+        }
+
         // VALIDATE_NEGOTIATE_INFO is handled inside libsmb2 before this point.
         // Server-side copy needs passthrough (the generic IOCTL reply encoder
         // only ships raw output in passthrough), so gate on fullControlEnabled.
