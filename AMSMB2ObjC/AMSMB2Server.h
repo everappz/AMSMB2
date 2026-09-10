@@ -61,6 +61,10 @@ typedef NS_ENUM(NSInteger, AMSMB2CreateDisposition) {
 @property (nonatomic) BOOL isHidden;
 /// Marks the item a symbolic link / reparse point (FILE_ATTRIBUTE_REPARSE_POINT, tag SYMLINK).
 @property (nonatomic) BOOL isSymbolicLink;
+/// Stable, unique file reference number (the inode on a real filesystem). Emitted as the FileId in
+/// directory listings. A non-zero, per-file-stable value lets clients (macOS in particular) cache each
+/// entry by reference number instead of re-querying every file individually. 0 = unknown (FileId omitted).
+@property (nonatomic) uint64_t fileIdentifier;
 
 + (instancetype)fileInfoWithName:(NSString *)name
                      isDirectory:(BOOL)isDirectory
