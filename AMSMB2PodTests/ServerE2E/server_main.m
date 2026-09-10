@@ -1,5 +1,8 @@
 #import <Foundation/Foundation.h>
 #import "AMSMB2Server.h"
+#include <sys/stat.h>
+#include <unistd.h>
+#include <errno.h>
 
 // A filesystem-backed delegate over a temp directory — the smallest real
 // backing store to prove the wrapper end-to-end.
@@ -20,6 +23,17 @@
 
 - (AMSMB2FileInfo *)infoForDisk:(NSString *)disk name:(NSString *)name
 {
+    // Detect symlinks with lstat (do NOT follow) so they report as reparse points.
+    struct stat lst;
+    if (lstat(disk.fileSystemRepresentation, &lst) == 0 && S_ISLNK(lst.st_mode)) {
+        AMSMB2FileInfo *fi = [AMSMB2FileInfo fileInfoWithName:(name ?: @"") isDirectory:NO size:0];
+        fi.isSymbolicLink = YES;
+        fi.modificationDate = [NSDate dateWithTimeIntervalSince1970:lst.st_mtimespec.tv_sec];
+        fi.creationDate = fi.modificationDate;
+        fi.lastAccessDate = fi.modificationDate;
+        return fi;
+    }
+
     NSFileManager *fm = NSFileManager.defaultManager;
     BOOL isDir = NO;
     BOOL exists = [fm fileExistsAtPath:disk isDirectory:&isDir];
@@ -41,6 +55,22 @@
     NSFileManager *fm = NSFileManager.defaultManager;
     NSString *rel = path ?: @"";
     NSString *disk = rel.length ? [self.root stringByAppendingPathComponent:rel] : self.root;
+
+    // Existing symlink: open the LINK itself (lstat, do NOT follow) so it can be read
+    // (GET_REPARSE_POINT) or deleted even when dangling. Following it (fileExistsAtPath) would fail
+    // for a dangling link and leak it. Exclusive-create over an existing name still collides.
+    struct stat lst;
+    if (lstat(disk.fileSystemRepresentation, &lst) == 0 && S_ISLNK(lst.st_mode)) {
+        if (disp == AMSMB2CreateDispositionCreate) {
+            if (error) *error = [NSError errorWithDomain:NSPOSIXErrorDomain code:EEXIST userInfo:nil];
+            return nil;
+        }
+        FSHandle *sh = [FSHandle new];
+        sh.disk = disk; sh.rel = rel; sh.isDir = NO; sh.fh = nil;
+        if (outInfo) *outInfo = [self infoForDisk:disk name:rel.lastPathComponent];
+        return sh;
+    }
+
     BOOL isDir = NO;
     BOOL exists = [fm fileExistsAtPath:disk isDirectory:&isDir];
     BOOL wantDir = (opts & 0x00000001) != 0; // FILE_DIRECTORY_FILE
@@ -71,9 +101,15 @@
     }
 
     switch (disp) {
-        case AMSMB2CreateDispositionOpen:      if (!exists) return nil; break;
-        case AMSMB2CreateDispositionCreate:    if (exists)  return nil; break;
-        case AMSMB2CreateDispositionOverwrite: if (!exists) return nil; break;
+        case AMSMB2CreateDispositionOpen:
+            if (!exists) { if (error) *error = [NSError errorWithDomain:NSPOSIXErrorDomain code:ENOENT userInfo:nil]; return nil; }
+            break;
+        case AMSMB2CreateDispositionCreate:
+            if (exists)  { if (error) *error = [NSError errorWithDomain:NSPOSIXErrorDomain code:EEXIST userInfo:nil]; return nil; }
+            break;
+        case AMSMB2CreateDispositionOverwrite:
+            if (!exists) { if (error) *error = [NSError errorWithDomain:NSPOSIXErrorDomain code:ENOENT userInfo:nil]; return nil; }
+            break;
         default: break;
     }
     if (!exists) {
@@ -158,6 +194,48 @@
     FSHandle *h = handle;
     @try { [h.fh synchronizeFile]; } @catch (__unused NSException *ex) {}
     return YES;
+}
+
+// FSCTL_SET_REPARSE_POINT: replace the just-created placeholder file with a POSIX symlink.
+- (BOOL)server:(AMSMB2Server *)s createSymbolicLinkAtItem:(id)handle
+    withTarget:(NSString *)target error:(NSError **)e
+{
+    FSHandle *h = handle;
+    [h.fh closeFile]; h.fh = nil;
+    [NSFileManager.defaultManager removeItemAtPath:h.disk error:nil]; // drop the CREATE placeholder
+    if (symlink(target.fileSystemRepresentation, h.disk.fileSystemRepresentation) != 0) {
+        if (e) *e = [NSError errorWithDomain:NSPOSIXErrorDomain code:errno userInfo:nil];
+        return NO;
+    }
+    return YES;
+}
+
+// FSCTL_GET_REPARSE_POINT: read the symlink target (do not follow).
+- (NSString *)server:(AMSMB2Server *)s symbolicLinkTargetForItem:(id)handle error:(NSError **)e
+{
+    FSHandle *h = handle;
+    char buf[4096];
+    ssize_t n = readlink(h.disk.fileSystemRepresentation, buf, sizeof(buf) - 1);
+    if (n < 0) {
+        if (e) *e = [NSError errorWithDomain:NSPOSIXErrorDomain code:errno userInfo:nil];
+        return nil;
+    }
+    buf[n] = '\0';
+    return [NSString stringWithUTF8String:buf];
+}
+
+// SET_INFO FileBasicInformation: persist the timestamps the client set (nil = leave unchanged).
+- (BOOL)server:(AMSMB2Server *)s updateItem:(id)handle
+  creationDate:(NSDate *)creationDate modificationDate:(NSDate *)modificationDate
+    accessDate:(NSDate *)accessDate attributes:(NSNumber *)attributes error:(NSError **)e
+{
+    FSHandle *h = handle;
+    (void)accessDate; (void)attributes; // no NSFileManager keys for access-date/attributes here
+    NSMutableDictionary *attrs = [NSMutableDictionary dictionary];
+    if (creationDate) attrs[NSFileCreationDate] = creationDate;
+    if (modificationDate) attrs[NSFileModificationDate] = modificationDate;
+    if (attrs.count == 0) return YES;
+    return [NSFileManager.defaultManager setAttributes:attrs ofItemAtPath:h.disk error:e];
 }
 
 @end

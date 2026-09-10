@@ -149,6 +149,9 @@ static uint32_t AMAttributesFromInfo(AMSMB2FileInfo *info)
     if (info.isHidden) {
         attr |= SMB2_FILE_ATTRIBUTE_HIDDEN;
     }
+    if (info.isSymbolicLink) {
+        attr |= SMB2_FILE_ATTRIBUTE_REPARSE_POINT;
+    }
     if (attr == 0) {
         attr = SMB2_FILE_ATTRIBUTE_NORMAL;
     }
@@ -614,6 +617,7 @@ static int am_logoff(struct smb2_server *srvr, struct smb2_context *smb2)
 // srvsvc opnums (MS-SRVS). Defined locally: libsmb2 keeps these in the non-public dcerpc headers.
 #define AM_SRVSVC_NETRSHAREENUM     0x0f
 #define AM_SRVSVC_NETRSHAREGETINFO  0x10
+#define AM_SRVSVC_NETRSERVERGETINFO 0x15
 
 /// If `path` names a known MS-RPC endpoint served over a named pipe, returns the lowercased pipe
 /// name; otherwise nil. Detection is by NAME (leading separators stripped): the CREATE handler has
@@ -733,8 +737,33 @@ static NSData *_Nullable AMBuildShareEnumResponse(AMSMB2Server *server, struct s
     return [NSData dataWithBytes:buf length:(NSUInteger)n];
 }
 
+/// Build the NetrShareGetInfo (opnum 0x10) level-1 response for our disk share.
+static NSData *_Nullable AMBuildShareGetInfoResponse(AMSMB2Server *server, struct smb2_context *smb2,
+                                                     uint32_t callId, uint16_t contextId)
+{
+    NSString *shareName = server.shareName.length ? server.shareName : @"Share";
+    uint8_t buf[8192];
+    int n = smb2_srvsvc_server_netsharegetinfo(smb2, callId, contextId,
+                                               shareName.UTF8String, SRVSVC_SHARE_TYPE_DISKTREE,
+                                               buf, (int)sizeof(buf));
+    if (n <= 0) { SMBSrvLog(@"NetrShareGetInfo encode FAILED (n=%d)", n); return nil; }
+    return [NSData dataWithBytes:buf length:(NSUInteger)n];
+}
+
+/// Build the NetrServerGetInfo (opnum 0x15) level-101 response describing this server.
+static NSData *_Nullable AMBuildServerGetInfoResponse(AMSMB2Server *server, struct smb2_context *smb2,
+                                                      uint32_t callId, uint16_t contextId)
+{
+    NSString *host = server.hostName.length ? server.hostName : @"SMB";
+    uint8_t buf[8192];
+    int n = smb2_srvsvc_server_netservergetinfo(smb2, callId, contextId,
+                                                host.UTF8String, "", buf, (int)sizeof(buf));
+    if (n <= 0) { SMBSrvLog(@"NetrServerGetInfo encode FAILED (n=%d)", n); return nil; }
+    return [NSData dataWithBytes:buf length:(NSUInteger)n];
+}
+
 /// Turn one inbound DCE/RPC pipe PDU into the response bytes (or nil to fail the op). Handles BIND /
-/// ALTER_CONTEXT and REQUEST (srvsvc NetrShareEnum). Other opnums -> FAULT.
+/// ALTER_CONTEXT and REQUEST (srvsvc NetrShareEnum / NetrShareGetInfo / NetrServerGetInfo). Other opnums -> FAULT.
 static NSData *_Nullable AMHandlePipeInput(AMSMB2Server *server, struct smb2_context *smb2,
                                            AMSMB2ServerOpenFile *file, NSData *input)
 {
@@ -778,9 +807,11 @@ static NSData *_Nullable AMHandlePipeInput(AMSMB2Server *server, struct smb2_con
 
         if (opnum == AM_SRVSVC_NETRSHAREENUM) {
             out = AMBuildShareEnumResponse(server, smb2, callId, contextId);
+        } else if (opnum == AM_SRVSVC_NETRSHAREGETINFO) {
+            out = AMBuildShareGetInfoResponse(server, smb2, callId, contextId);
+        } else if (opnum == AM_SRVSVC_NETRSERVERGETINFO) {
+            out = AMBuildServerGetInfoResponse(server, smb2, callId, contextId);
         } else {
-            // NetrShareGetInfo (0x10) and everything else -> FAULT. Finder browses via
-            // NetrShareEnum; GetInfo's rep coder is not built in libsmb2's minimal dcerpc.
             SMBSrvLog(@"pipe '%@' unsupported opnum 0x%02x -> FAULT", file.pipeName, opnum);
             out = AMBuildFault(callId, contextId, 0x1C010002 /* nca_op_rng_error */);
         }
@@ -917,6 +948,11 @@ static int am_create(struct smb2_server *srvr, struct smb2_context *smb2, struct
                             fileInfo:&info
                                error:&err];
         if (!handle) {
+            // Propagate a POSIX errno so libsmb2 maps it to a specific NT status (e.g. EEXIST ->
+            // STATUS_OBJECT_NAME_COLLISION for a create-disposition clash); else generic failure.
+            if (err && [err.domain isEqualToString:NSPOSIXErrorDomain] && err.code > 0) {
+                return (int)err.code;
+            }
             return -1;
         }
         if (!info) {
@@ -1125,6 +1161,26 @@ static int am_lock(struct smb2_server *srvr, struct smb2_context *smb2, struct s
     return 0;
 }
 
+/// Build a symlink REPARSE_DATA_BUFFER (MS-FSCC 2.1.2.4) for FSCTL_GET_REPARSE_POINT. Substitute and
+/// print names are both `target` (UTF-16LE); flags = SYMLINK_FLAG_RELATIVE. Path buffer starts at 20.
+static NSData *AMBuildSymlinkReparseBuffer(NSString *target)
+{
+    NSData *name = [target dataUsingEncoding:NSUTF16LittleEndianStringEncoding] ?: [NSData data];
+    uint16_t nameLen = (uint16_t)name.length;
+    NSMutableData *d = [NSMutableData data];
+    AMAppendLE32(d, SMB2_REPARSE_TAG_SYMLINK);                 // ReparseTag
+    AMAppendLE16(d, (uint16_t)(12 + nameLen + nameLen));       // ReparseDataLength (symlink buffer)
+    AMAppendLE16(d, 0);                                        // Reserved
+    AMAppendLE16(d, 0);                                        // SubstituteNameOffset
+    AMAppendLE16(d, nameLen);                                  // SubstituteNameLength
+    AMAppendLE16(d, nameLen);                                  // PrintNameOffset
+    AMAppendLE16(d, nameLen);                                  // PrintNameLength
+    AMAppendLE32(d, 1);                                        // Flags = SYMLINK_FLAG_RELATIVE
+    [d appendData:name];                                      // SubstituteName
+    [d appendData:name];                                      // PrintName
+    return d;
+}
+
 static int am_ioctl(struct smb2_server *srvr, struct smb2_context *smb2, struct smb2_ioctl_request *req, struct smb2_ioctl_reply *rep)
 {
     @autoreleasepool {
@@ -1245,6 +1301,46 @@ static int am_ioctl(struct smb2_server *srvr, struct smb2_context *smb2, struct 
                 conn.pendingIoctlData = data;
                 rep->output = (void *)data.bytes;
                 rep->output_count = (uint32_t)data.length;
+                return 0;
+            }
+            case SMB2_FSCTL_SET_REPARSE_POINT: {
+                // MS-FSCC 2.1.2.4: tag(4) datalen(2) reserved(2) then the symlink buffer
+                // subOff(2) subLen(2) prnOff(2) prnLen(2) flags(4), then the path buffer @20.
+                AMSMB2ServerOpenFile *lf = AMFileForId(conn, req->file_id);
+                const uint8_t *in = (const uint8_t *)req->input;
+                uint32_t inLen = req->input_count;
+                if (!lf || !in || inLen < 20) { return -1; }
+                if (AMReadLE32(in) != SMB2_REPARSE_TAG_SYMLINK) { return -1; }
+                uint16_t subOff = AMReadLE16(in + 8), subLen = AMReadLE16(in + 10);
+                if ((uint32_t)20 + subOff + subLen > inLen) { return -1; }
+                NSString *target = [[NSString alloc] initWithBytes:in + 20 + subOff length:subLen
+                                                          encoding:NSUTF16LittleEndianStringEncoding] ?: @"";
+                if (![delegate respondsToSelector:@selector(server:createSymbolicLinkAtItem:withTarget:error:)]) {
+                    return -1;
+                }
+                NSError *serr = nil;
+                if (![delegate server:server createSymbolicLinkAtItem:lf.handle withTarget:target error:&serr]) {
+                    return -1;
+                }
+                SMBSrvLog(@"SET_REPARSE '%@' -> symlink target '%@'", lf.path, target);
+                lf.info.isSymbolicLink = YES;
+                rep->output = NULL;           // SET_REPARSE_POINT has no output
+                rep->output_count = 0;
+                return 0;
+            }
+            case SMB2_FSCTL_GET_REPARSE_POINT: {
+                AMSMB2ServerOpenFile *lf = AMFileForId(conn, req->file_id);
+                if (!lf) { return -1; }
+                if (![delegate respondsToSelector:@selector(server:symbolicLinkTargetForItem:error:)]) {
+                    return -1;
+                }
+                NSError *gerr = nil;
+                NSString *target = [delegate server:server symbolicLinkTargetForItem:lf.handle error:&gerr];
+                if (!target) { return -1; }
+                NSData *out = AMBuildSymlinkReparseBuffer(target);
+                conn.pendingIoctlData = out;  // keep alive until libsmb2 encodes the reply (passthrough)
+                rep->output = (void *)out.bytes;
+                rep->output_count = (uint32_t)out.length;
                 return 0;
             }
             default:
@@ -1617,6 +1713,14 @@ static int am_query_info(struct smb2_server *srvr, struct smb2_context *smb2, st
                     fs->mode = 0;
                     fs->alignment_requirement = 0;
                     fs->name = (const uint8_t *)"";
+                    buffer = fs;
+                    length = sizeof(*fs);
+                    break;
+                }
+                case SMB2_FILE_ATTRIBUTE_TAG_INFORMATION: {
+                    struct smb2_file_attribute_tag_info *fs = calloc(1, sizeof(*fs));
+                    fs->file_attributes = AMAttributesFromInfo(info);
+                    fs->reparse_tag = info.isSymbolicLink ? SMB2_REPARSE_TAG_SYMLINK : 0;
                     buffer = fs;
                     length = sizeof(*fs);
                     break;

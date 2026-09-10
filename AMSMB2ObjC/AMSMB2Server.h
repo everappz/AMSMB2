@@ -59,6 +59,8 @@ typedef NS_ENUM(NSInteger, AMSMB2CreateDisposition) {
 @property (nonatomic) BOOL isReadOnly;
 /// Marks the item hidden (FILE_ATTRIBUTE_HIDDEN).
 @property (nonatomic) BOOL isHidden;
+/// Marks the item a symbolic link / reparse point (FILE_ATTRIBUTE_REPARSE_POINT, tag SYMLINK).
+@property (nonatomic) BOOL isSymbolicLink;
 
 + (instancetype)fileInfoWithName:(NSString *)name
                      isDirectory:(BOOL)isDirectory
@@ -205,6 +207,20 @@ modificationDate:(nullable NSDate *)modificationDate
     accessDate:(nullable NSDate *)accessDate
     attributes:(nullable NSNumber *)attributes
          error:(NSError *_Nullable *_Nullable)error;
+
+/// Turn `handle` (an already-created placeholder file) into a symbolic link pointing at `target`
+/// (a share-relative or absolute path, as the client sent it). Invoked for FSCTL_SET_REPARSE_POINT
+/// with a symlink reparse tag. Only invoked when `fullControlEnabled` is set. Return `YES` on success.
+- (BOOL)server:(AMSMB2Server *)server
+createSymbolicLinkAtItem:(id)handle
+    withTarget:(NSString *)target
+         error:(NSError *_Nullable *_Nullable)error;
+
+/// Return the target path of the symbolic link `handle` points at (for FSCTL_GET_REPARSE_POINT /
+/// destinationOfSymbolicLink), or nil on failure.
+- (nullable NSString *)server:(AMSMB2Server *)server
+     symbolicLinkTargetForItem:(id)handle
+                         error:(NSError *_Nullable *_Nullable)error;
 
 /// Server-side copy of one chunk (SMB2 FSCTL_SRV_COPYCHUNK), letting a backend
 /// copy without round-tripping bytes through the client (e.g. APFS clonefile).
