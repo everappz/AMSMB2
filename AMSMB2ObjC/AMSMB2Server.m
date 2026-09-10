@@ -260,9 +260,6 @@ static NSString *AMPathFromCName(const char *_Nullable cname)
 // Retains the raw IOCTL reply payload (resume key / copychunk result) until
 // libsmb2 copies it into the reply PDU.
 @property (nonatomic, nullable, strong) NSData *pendingIoctlData;
-// Retains the CREATE reply's create-context blob (the AAPL server-caps answer)
-// until libsmb2 copies it into the reply PDU.
-@property (nonatomic, nullable, strong) NSData *pendingCreateContextData;
 @end
 
 @implementation AMSMB2ServerConnection
@@ -890,83 +887,6 @@ static int am_tree_disconnect(struct smb2_server *srvr, struct smb2_context *smb
 
 #pragma mark - C handlers: create / close
 
-// Apple SMB2 "AAPL" create-context extension (as used by macOS' SMBClient and Samba's vfs_fruit). When
-// the client sends an "AAPL" context on a CREATE, answering with SUPPORTS_READ_DIR_ATTR makes Finder do
-// ONE bulk directory enumeration and read the resource-fork size / FinderInfo straight from each entry,
-// instead of opening every file plus its "._name" AppleDouble sidecar. Our files have no resource forks
-// or FinderInfo, so a normal FileIdBothDirectoryInformation entry (EaSize 0, ShortName area 0, real
-// FileId) already IS the read-dir-attr format, so no extra per-entry fields are needed.
-#define AM_AAPL_SERVER_QUERY            1
-#define AM_AAPL_BIT_SERVER_CAPS         0x01
-#define AM_AAPL_BIT_VOLUME_CAPS         0x02
-#define AM_AAPL_BIT_MODEL_INFO          0x04
-#define AM_AAPL_CAP_READ_DIR_ATTR       0x01
-#define AM_AAPL_CAP_OSX_COPYFILE        0x02
-#define AM_AAPL_CAP_UNIX_BASED          0x04
-#define AM_AAPL_CAP_NFS_ACE             0x08
-
-// Find the data blob of the "AAPL" create context inside a CREATE request's context chain. Offsets in
-// each SMB2_CREATE_CONTEXT are relative to the start of that context. Returns NULL if not present.
-static const uint8_t *AMFindAAPLContext(const uint8_t *buf, uint32_t len, uint32_t *outLen)
-{
-    uint32_t off = 0;
-    while (buf && off + 16 <= len) {
-        const uint8_t *ctx = buf + off;
-        uint32_t next = AMReadLE32(ctx + 0);
-        uint16_t noff = AMReadLE16(ctx + 4);
-        uint16_t nlen = AMReadLE16(ctx + 6);
-        uint16_t doff = AMReadLE16(ctx + 10);
-        uint32_t dlen = AMReadLE32(ctx + 12);
-        uint32_t span = next ? next : (len - off);
-        if (nlen == 4 && (uint32_t)noff + 4 <= span && memcmp(ctx + noff, "AAPL", 4) == 0 &&
-            (uint32_t)doff + dlen <= span) {
-            if (outLen) { *outLen = dlen; }
-            return ctx + doff;
-        }
-        if (next < 16 || off + next > len) { break; }
-        off += next;
-    }
-    return NULL;
-}
-
-// Build the full SMB2_CREATE_CONTEXT (header + "AAPL" name + server-query reply) to return in the CREATE
-// reply, or nil if the request is not a server-query we answer. Reports READ_DIR_ATTR + UNIX_BASED.
-static NSData *_Nullable AMBuildAAPLReplyContext(const uint8_t *reqData, uint32_t reqLen)
-{
-    if (reqLen < 24 || AMReadLE32(reqData + 0) != AM_AAPL_SERVER_QUERY) { return nil; }
-    uint64_t reqBitmap = AMReadLE64(reqData + 8);
-
-    // Reply payload: command(4) + reserved(4) + reply_bitmap(8) + optional caps blocks.
-    NSMutableData *payload = [NSMutableData dataWithLength:16];
-    uint8_t *pp = payload.mutableBytes;
-    AMWriteLE32(pp + 0, AM_AAPL_SERVER_QUERY);
-    uint64_t replyBitmap = 0;
-    if (reqBitmap & AM_AAPL_BIT_SERVER_CAPS) {
-        replyBitmap |= AM_AAPL_BIT_SERVER_CAPS;
-        uint8_t caps[8]; AMWriteLE64(caps, AM_AAPL_CAP_READ_DIR_ATTR | AM_AAPL_CAP_UNIX_BASED);
-        [payload appendBytes:caps length:8];
-    }
-    if (reqBitmap & AM_AAPL_BIT_VOLUME_CAPS) {
-        replyBitmap |= AM_AAPL_BIT_VOLUME_CAPS;
-        uint8_t vcaps[8]; AMWriteLE64(vcaps, 0);   // not case-sensitive, no resolve-id
-        [payload appendBytes:vcaps length:8];
-    }
-    AMWriteLE64((uint8_t *)payload.mutableBytes + 8, replyBitmap);
-
-    // Wrap in a create context: header(16) + name "AAPL"(4) + pad(4) + data.
-    uint32_t dlen = (uint32_t)payload.length;
-    NSMutableData *ctx = [NSMutableData dataWithLength:24 + dlen];
-    uint8_t *p = ctx.mutableBytes;
-    AMWriteLE32(p + 0, 0);          // Next = 0 (only context)
-    p[4] = 16; p[5] = 0;            // NameOffset = 16
-    p[6] = 4;  p[7] = 0;            // NameLength = 4
-    p[10] = 24; p[11] = 0;          // DataOffset = 24
-    AMWriteLE32(p + 12, dlen);      // DataLength
-    memcpy(p + 16, "AAPL", 4);
-    memcpy(p + 24, payload.bytes, dlen);
-    return ctx;
-}
-
 static int am_create(struct smb2_server *srvr, struct smb2_context *smb2, struct smb2_create_request *req, struct smb2_create_reply *rep)
 {
     @autoreleasepool {
@@ -1070,21 +990,6 @@ static int am_create(struct smb2_server *srvr, struct smb2_context *smb2, struct
         rep->end_of_file = info.isDirectory ? 0 : info.fileSize;
         rep->file_attributes = AMAttributesFromInfo(info);
         memcpy(rep->file_id, fileId.bytes, SMB2_FD_SIZE);
-
-        // Apple SMB2 extension: if the client sent an "AAPL" create context, answer with our server
-        // capabilities (READ_DIR_ATTR) so macOS uses a single bulk enumeration and stops probing each
-        // file's "._name" AppleDouble sidecar. Retained on the connection until the reply is encoded.
-        if (req->create_context && req->create_context_length) {
-            uint32_t aaplLen = 0;
-            const uint8_t *aapl = AMFindAAPLContext(req->create_context, req->create_context_length, &aaplLen);
-            NSData *ctx = aapl ? AMBuildAAPLReplyContext(aapl, aaplLen) : nil;
-            if (ctx) {
-                conn.pendingCreateContextData = ctx;
-                rep->create_context = (uint8_t *)ctx.bytes;
-                rep->create_context_length = (uint32_t)ctx.length;
-                SMBSrvLog(@"AAPL create context -> READ_DIR_ATTR|UNIX_BASED (%lu bytes)", (unsigned long)ctx.length);
-            }
-        }
         return 0;
     }
 }
