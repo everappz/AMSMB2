@@ -13,7 +13,7 @@
 #include <smb2/libsmb2.h>
 #include <smb2/libsmb2-raw.h>
 #include <smb2/smb2-errors.h>
-#include <smb2/libsmb2-dcerpc-srvsvc.h>
+#include <smb2/libsmb2-share-enum.h>
 #include <poll.h>
 
 #pragma mark - Callback Data
@@ -423,19 +423,19 @@ static void smb2_generic_handler(struct smb2_context *smb2, int status, void *co
 
         if (ses->Level != 1) return;
 
-        struct srvsvc_SHARE_INFO_1_CONTAINER *container = &ses->ShareInfo.Level1;
-        if (!container->Buffer || !container->Buffer->share_info_1) return;
+        struct srvsvc_SHARE_INFO_1_CONTAINER *container = &ses->ShareEnum.Level1;
+        if (!container->share_info_1) return;
 
         uint32_t count = container->EntriesRead;
         shares = [[NSMutableArray alloc] initWithCapacity:count];
 
         for (uint32_t i = 0; i < count; i++) {
-            struct srvsvc_SHARE_INFO_1 *info = &container->Buffer->share_info_1[i];
-            NSString *name = info->netname.utf8
-                ? [NSString stringWithUTF8String:info->netname.utf8]
+            struct srvsvc_SHARE_INFO_1 *info = &container->share_info_1[i];
+            NSString *name = info->netname
+                ? [NSString stringWithUTF8String:info->netname]
                 : @"";
-            NSString *comment = info->remark.utf8
-                ? [NSString stringWithUTF8String:info->remark.utf8]
+            NSString *comment = info->remark
+                ? [NSString stringWithUTF8String:info->remark]
                 : @"";
             NSNumber *type = @(info->type);
 

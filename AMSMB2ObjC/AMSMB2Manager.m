@@ -376,9 +376,7 @@ static NSString *const kCodingKeyTimeout = @"timeout";
         struct smb2_stat_64 st = {0};
         if ([client stat:path result:&st error:&error]) {
             NSMutableDictionary *result = [NSMutableDictionary dictionary];
-            NSURL *fileURL = SMB2FileURLFromPath(path, st.smb2_type == SMB2_TYPE_DIRECTORY);
-            result[NSURLNameKey] = fileURL.lastPathComponent;
-            result[NSURLPathKey] = fileURL.path;
+            SMB2SetResultPath(result, path);
             SMB2PopulateResourceValues(result, &st);
             completionHandler(result, nil);
         } else {
@@ -722,12 +720,9 @@ static NSString *const kCodingKeyTimeout = @"timeout";
         NSString *entryName = [NSString stringWithUTF8String:name];
         if ([entryName isEqualToString:@"."] || [entryName isEqualToString:@".."]) return;
 
-        BOOL isDir = (st.smb2_type == SMB2_TYPE_DIRECTORY);
         NSMutableDictionary *result = [NSMutableDictionary dictionary];
-        NSURL *parentURL = SMB2FileURLFromPath(path, YES);
-        NSURL *entryURL = [parentURL URLByAppendingPathComponent:entryName isDirectory:isDir];
-        result[NSURLNameKey] = entryName;
-        result[NSURLPathKey] = entryURL.path;
+        // Unicode-safe path building (never via NSURL) so umlaut/accented names resolve on the server.
+        SMB2SetResultPath(result, [path stringByAppendingPathComponent:entryName]);
         SMB2PopulateResourceValues(result, &st);
         [contents addObject:result];
     }];

@@ -35,12 +35,14 @@ let package = Package(
             exclude: [
                 "lib/CMakeLists.txt",
                 "lib/libsmb2.syms",
+                "lib/libsmb2-dcerpc-full.syms",
                 "lib/Makefile.am",
                 "lib/Makefile.AMIGA",
                 "lib/Makefile.AMIGA_AROS",
                 "lib/Makefile.AMIGA_OS3",
                 "lib/Makefile.PS3_PPU",
                 "lib/ps2",
+                "lib/dreamcast",
             ],
             sources: [
                 "lib",
@@ -53,6 +55,12 @@ let package = Package(
                 .headerSearchPath("lib"),
                 .define("_U_", to: "__attribute__((unused))"),
                 .define("HAVE_CONFIG_H", to: "1"),
+                // libsmb2's minimal DCE/RPC build renames its internal symbols via a
+                // textual prefix header (lib/libsmb2-dcerpc-prefix.h). Clang modules would
+                // load the dcerpc headers as a prebuilt (unprefixed) module and ignore
+                // those macros, breaking the build. Force textual includes so the prefix
+                // applies (the CocoaPods build sets CLANG_ENABLE_MODULES=NO for the same reason).
+                .unsafeFlags(["-fno-modules"]),
             ],
             linkerSettings: [
             ]

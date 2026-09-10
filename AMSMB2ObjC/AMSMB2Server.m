@@ -19,8 +19,8 @@
 #include <smb2/libsmb2.h>
 #include <smb2/libsmb2-raw.h>
 #include <smb2/smb2-errors.h>
-#include <smb2/libsmb2-dcerpc.h>
-#include <smb2/libsmb2-dcerpc-srvsvc.h>
+#include <smb2/libsmb2-share-enum.h>      // SRVSVC_SHARE_TYPE_* share-type bits
+#include <smb2/libsmb2-srvsvc-server.h>   // smb2_srvsvc_server_netshareenum()
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -611,6 +611,10 @@ static int am_logoff(struct smb2_server *srvr, struct smb2_context *smb2)
 #define AM_DCERPC_PT_ALTER_CONTEXT  0x0e
 #define AM_DCERPC_PT_ALTER_CTX_RESP 0x0f
 
+// srvsvc opnums (MS-SRVS). Defined locally: libsmb2 keeps these in the non-public dcerpc headers.
+#define AM_SRVSVC_NETRSHAREENUM     0x0f
+#define AM_SRVSVC_NETRSHAREGETINFO  0x10
+
 /// If `path` names a known MS-RPC endpoint served over a named pipe, returns the lowercased pipe
 /// name; otherwise nil. Detection is by NAME (leading separators stripped): the CREATE handler has
 /// no tree id, so this is how a `\\server\IPC$\srvsvc` open is told apart from a disk-share file.
@@ -707,44 +711,21 @@ static NSData *AMBuildFault(uint32_t callId, uint16_t contextId, uint32_t status
 }
 
 /// Build the NetrShareEnum (opnum 0x0f) level-1 response: the single disk share plus IPC$.
-static NSData *_Nullable AMBuildShareEnumResponse(AMSMB2Server *server, struct dcerpc_context *dce,
+/// The NDR marshalling lives inside libsmb2 (smb2_srvsvc_server_netshareenum), which reuses the
+/// same coders the client decode path uses; here we just pass the share list.
+static NSData *_Nullable AMBuildShareEnumResponse(AMSMB2Server *server, struct smb2_context *smb2,
                                                   uint32_t callId, uint16_t contextId)
 {
     NSString *shareName = server.shareName.length ? server.shareName : @"Share";
-    const char *shareNameC = shareName.UTF8String; // valid for the synchronous encode below
-
-    struct srvsvc_SHARE_INFO_1 shares[2];
-    memset(shares, 0, sizeof(shares));
-    shares[0].netname.utf8 = shareNameC;
-    shares[0].type = SHARE_TYPE_DISKTREE;
-    shares[0].remark.utf8 = "";
-    shares[1].netname.utf8 = "IPC$";
-    shares[1].type = SHARE_TYPE_IPC | SHARE_TYPE_HIDDEN;
-    shares[1].remark.utf8 = "Remote IPC";
-
-    struct srvsvc_SHARE_INFO_1_carray arr;
-    memset(&arr, 0, sizeof(arr));
-    arr.max_count = 2;
-    arr.share_info_1 = shares;
-
-    struct srvsvc_SHARE_INFO_1_CONTAINER ctr;
-    memset(&ctr, 0, sizeof(ctr));
-    ctr.EntriesRead = 2;
-    ctr.Buffer = &arr;
-
-    struct srvsvc_NetrShareEnum_rep rep;
-    memset(&rep, 0, sizeof(rep));
-    rep.ses.Level = 1;
-    rep.ses.ShareInfo.Level = 1;
-    rep.ses.ShareInfo.Level1 = ctr;
-    rep.total_entries = 2;
-    rep.resume_handle = 0;
-    rep.status = 0;
+    const char *names[2] = { shareName.UTF8String, "IPC$" };
+    uint32_t types[2] = {
+        SRVSVC_SHARE_TYPE_DISKTREE,
+        SRVSVC_SHARE_TYPE_IPC | SRVSVC_SHARE_TYPE_HIDDEN,
+    };
 
     uint8_t buf[16384];
-    int n = dcerpc_server_build_response(dce, callId, contextId,
-                                         srvsvc_NetrShareEnum_rep_coder, &rep,
-                                         buf, (int)sizeof(buf));
+    int n = smb2_srvsvc_server_netshareenum(smb2, callId, contextId,
+                                            names, types, 2, buf, (int)sizeof(buf));
     if (n <= 0) {
         SMBSrvLog(@"NetrShareEnum encode FAILED (n=%d)", n);
         return nil;
@@ -752,34 +733,8 @@ static NSData *_Nullable AMBuildShareEnumResponse(AMSMB2Server *server, struct d
     return [NSData dataWithBytes:buf length:(NSUInteger)n];
 }
 
-/// Build the NetrShareGetInfo (opnum 0x10) level-1 response for the disk share.
-static NSData *_Nullable AMBuildShareGetInfoResponse(AMSMB2Server *server, struct dcerpc_context *dce,
-                                                     uint32_t callId, uint16_t contextId)
-{
-    NSString *shareName = server.shareName.length ? server.shareName : @"Share";
-    const char *shareNameC = shareName.UTF8String;
-
-    struct srvsvc_NetrShareGetInfo_rep rep;
-    memset(&rep, 0, sizeof(rep));
-    rep.InfoStruct.level = 1;
-    rep.InfoStruct.ShareInfo1.netname.utf8 = shareNameC;
-    rep.InfoStruct.ShareInfo1.type = SHARE_TYPE_DISKTREE;
-    rep.InfoStruct.ShareInfo1.remark.utf8 = "";
-    rep.status = 0;
-
-    uint8_t buf[8192];
-    int n = dcerpc_server_build_response(dce, callId, contextId,
-                                         srvsvc_NetrShareGetInfo_rep_coder, &rep,
-                                         buf, (int)sizeof(buf));
-    if (n <= 0) {
-        SMBSrvLog(@"NetrShareGetInfo encode FAILED (n=%d)", n);
-        return nil;
-    }
-    return [NSData dataWithBytes:buf length:(NSUInteger)n];
-}
-
 /// Turn one inbound DCE/RPC pipe PDU into the response bytes (or nil to fail the op). Handles BIND /
-/// ALTER_CONTEXT and REQUEST (srvsvc NetrShareEnum / NetrShareGetInfo). Everything else -> FAULT.
+/// ALTER_CONTEXT and REQUEST (srvsvc NetrShareEnum). Other opnums -> FAULT.
 static NSData *_Nullable AMHandlePipeInput(AMSMB2Server *server, struct smb2_context *smb2,
                                            AMSMB2ServerOpenFile *file, NSData *input)
 {
@@ -821,20 +776,14 @@ static NSData *_Nullable AMHandlePipeInput(AMSMB2Server *server, struct smb2_con
         uint16_t opnum     = AMReadLE16(b + 22);
         SMBSrvLog(@"pipe '%@' REQUEST opnum=0x%02x context_id=%u", file.pipeName, opnum, contextId);
 
-        struct dcerpc_context *dce = dcerpc_create_context(smb2);
-        if (!dce) {
-            SMBSrvLog(@"pipe '%@' dcerpc_create_context failed", file.pipeName);
-            return nil;
-        }
-        if (opnum == SRVSVC_NETRSHAREENUM) {
-            out = AMBuildShareEnumResponse(server, dce, callId, contextId);
-        } else if (opnum == SRVSVC_NETRSHAREGETINFO) {
-            out = AMBuildShareGetInfoResponse(server, dce, callId, contextId);
+        if (opnum == AM_SRVSVC_NETRSHAREENUM) {
+            out = AMBuildShareEnumResponse(server, smb2, callId, contextId);
         } else {
+            // NetrShareGetInfo (0x10) and everything else -> FAULT. Finder browses via
+            // NetrShareEnum; GetInfo's rep coder is not built in libsmb2's minimal dcerpc.
             SMBSrvLog(@"pipe '%@' unsupported opnum 0x%02x -> FAULT", file.pipeName, opnum);
             out = AMBuildFault(callId, contextId, 0x1C010002 /* nca_op_rng_error */);
         }
-        dcerpc_destroy_context(dce);
         if (out) {
             SMBSrvLog(@"pipe '%@' -> RESPONSE opnum=0x%02x (%lu bytes)",
                       file.pipeName, opnum, (unsigned long)out.length);

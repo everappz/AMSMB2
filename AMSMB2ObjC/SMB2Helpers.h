@@ -26,8 +26,16 @@ NSError *SMB2POSIXError(int code, NSString *_Nullable description);
 /// Trims leading/trailing '/' and '\' characters.
 NSString *SMB2CanonicalPath(NSString *path);
 
-/// Makes a file URL from a path string.
+/// Makes a file URL from a path string. NOTE: for DISPLAY only. Do NOT use it (or any NSURL path API)
+/// to build addressable server paths: NSURL renormalizes Unicode and breaks umlaut/accented names.
 NSURL *SMB2FileURLFromPath(NSString *path, BOOL isDirectory);
+
+/// Populate a listing/attributes result dictionary's name (`NSURLNameKey`) and addressable path
+/// (`NSURLPathKey`) from a plain server path, using NSString path ops ONLY (never NSURL, which
+/// renormalizes Unicode so umlaut/accented names fail to resolve on the server, e.g. recursive
+/// delete failing with STATUS_OBJECT_PATH_NOT_FOUND). All wrapper path building must go through
+/// this or `SMB2CanonicalPath` so the exact server bytes are preserved.
+void SMB2SetResultPath(NSMutableDictionary<NSURLResourceKey, id> *dict, NSString *path);
 
 #pragma mark - Data Helpers
 

@@ -72,6 +72,13 @@ NSURL *SMB2FileURLFromPath(NSString *path, BOOL isDirectory) {
     return [NSURL fileURLWithPath:path isDirectory:isDirectory relativeToURL:rootURL];
 }
 
+void SMB2SetResultPath(NSMutableDictionary<NSURLResourceKey, id> *dict, NSString *path) {
+    // NSString path ops only: no NSURL, so the exact server bytes (incl. umlaut/accented chars) survive.
+    NSString *canonical = SMB2CanonicalPath(path);
+    dict[NSURLNameKey] = canonical.lastPathComponent ?: canonical;
+    dict[NSURLPathKey] = canonical;
+}
+
 #pragma mark - Data Helpers
 
 uint16_t SMB2DataScanUInt16(NSData *data, NSUInteger offset) {

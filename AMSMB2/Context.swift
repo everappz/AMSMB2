@@ -618,11 +618,11 @@ struct ShareProperties: RawRepresentable {
     }
 
     var isTemporary: Bool {
-        rawValue & UInt32(bitPattern: SHARE_TYPE_TEMPORARY) != 0
+        rawValue & UInt32(bitPattern: SRVSVC_SHARE_TYPE_TEMPORARY) != 0
     }
 
     var isHidden: Bool {
-        rawValue & SHARE_TYPE_HIDDEN != 0
+        rawValue & SRVSVC_SHARE_TYPE_HIDDEN != 0
     }
 }
 

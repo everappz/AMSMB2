@@ -43,6 +43,8 @@ clang -o "$BUILD/client_bin" "$HERE/client_main.c" "$BUILD/libsmb2.a" \
   -I "$LSMB/include" -isysroot "$SDK" -framework Foundation -framework Security
 clang -o "$BUILD/client_tests" "$HERE/client_tests.c" "$BUILD/libsmb2.a" \
   -I "$LSMB/include" -isysroot "$SDK" -framework Foundation -framework Security
+clang -o "$BUILD/client_shareenum" "$HERE/client_shareenum.c" "$BUILD/libsmb2.a" \
+  -I "$LSMB/include" -isysroot "$SDK" -framework Foundation -framework Security
 
 echo "== running server on 127.0.0.1:$PORT =="
 ROOT="$(mktemp -d /tmp/amsmb2-share.XXXXXX)"
@@ -58,3 +60,7 @@ echo "== smoke test =="
 echo ""
 echo "== comprehensive suite (30 tests) =="
 "$BUILD/client_tests" "127.0.0.1:$PORT"
+
+echo ""
+echo "== share enumeration (srvsvc NetrShareEnum) =="
+"$BUILD/client_shareenum" "127.0.0.1:$PORT"

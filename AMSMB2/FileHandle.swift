@@ -241,7 +241,13 @@ final class SMB2FileHandle: @unchecked Sendable {
                 tv_sec: .init(stat.smb2_ctime),
                 tv_usec: .init(stat.smb2_ctime_nsec / 1000)
             ),
-            file_attributes: attributes.rawValue
+            file_attributes: attributes.rawValue,
+            // Raw 100ns FILETIME fields (added upstream for read precision) are ignored by the
+            // SET_INFO encoder, which uses the timeval fields above; zero them for the memberwise init.
+            creation_time_raw: 0,
+            last_access_time_raw: 0,
+            last_write_time_raw: 0,
+            change_time_raw: 0
         )
         try setInfo(bfi, infoClass: .basic)
     }
@@ -683,7 +689,24 @@ extension SMB2FileHandle {
                 insert(.openReparsePoint)
             }
         }
-        
+
+        /// Build create options from raw POSIX open flags (O_DIRECTORY / O_SYNC / O_SYMLINK),
+        /// applying the same MS-FSCC §2.1.5.1 constraint: FILE_NO_INTERMEDIATE_BUFFERING is
+        /// suppressed on directory opens (Windows rejects DIRECTORY_FILE + NO_INTERMEDIATE_BUFFERING).
+        init(flags: Int32) {
+            self = []
+            let isDirectory = (flags & O_DIRECTORY) != 0
+            if isDirectory {
+                insert(.directoryFile)
+            }
+            if (flags & O_SYNC) != 0 && !isDirectory {
+                insert(.noIntermediateBuffering)
+            }
+            if (flags & O_SYMLINK) != 0 {
+                insert(.openReparsePoint)
+            }
+        }
+
         static let directoryFile = Self(rawValue: SMB2_FILE_DIRECTORY_FILE)
         static let writeThrough = Self(rawValue: SMB2_FILE_WRITE_THROUGH)
         static let sequentialOnly = Self(rawValue: SMB2_FILE_SEQUENTIAL_ONLY)
