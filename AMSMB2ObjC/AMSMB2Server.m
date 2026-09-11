@@ -2031,7 +2031,10 @@ static int am_query_info(struct smb2_server *srvr, struct smb2_context *smb2, st
                     fs->standard.number_of_links = 1;
                     fs->standard.delete_pending = file.deleteOnClose ? 1 : 0;
                     fs->standard.directory = info.isDirectory ? 1 : 0;
-                    fs->index_number = 0;
+                    // The file reference number (inode). Must equal the FileId advertised in the
+                    // directory listing (AMBuildDirWire) so the client's vnode cache stays valid and it
+                    // does not endlessly re-validate/re-crawl. The delegate supplies a stable id.
+                    fs->index_number = info.fileIdentifier;
                     fs->ea_size = 0;
                     fs->access_flags = 0x001f01ff;
                     fs->current_byte_offset = 0;
