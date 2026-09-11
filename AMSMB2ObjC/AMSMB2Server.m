@@ -260,6 +260,16 @@ static NSString *AMPathFromCName(const char *_Nullable cname)
 // Retains the raw IOCTL reply payload (resume key / copychunk result) until
 // libsmb2 copies it into the reply PDU.
 @property (nonatomic, nullable, strong) NSData *pendingIoctlData;
+// Retains the CREATE reply's Apple "AAPL" create-context blob until libsmb2 copies it into the reply PDU.
+@property (nonatomic, nullable, strong) NSData *pendingCreateContextData;
+// Set once when the client negotiated the Apple "AAPL" create context AND we advertised
+// SUPPORTS_READ_DIR_ATTR. When set, the directory-listing encoder repurposes the
+// FileIdBothDirectoryInformation fields (EaSize=max access, ShortName=rfork size+FinderInfo,
+// Reserved2=UNIX mode) so macOS reads metadata inline and stops probing every file plus its
+// "._name" AppleDouble sidecar. Only enabled in passthrough (full-control) mode, where the wire
+// encoder below runs; a read-only share keeps the plain listing (safe, since advertising the flag
+// without filling the fields makes macOS worse).
+@property (nonatomic) BOOL aaplReadDirAttr;
 @end
 
 @implementation AMSMB2ServerConnection
@@ -887,6 +897,92 @@ static int am_tree_disconnect(struct smb2_server *srvr, struct smb2_context *smb
 
 #pragma mark - C handlers: create / close
 
+// Apple SMB2 "AAPL" create-context extension (macOS SMBClient / Samba vfs_fruit / ksmbd). When the
+// client sends an "AAPL" server-query context on a CREATE, answering with SUPPORTS_READ_DIR_ATTR makes
+// Finder do ONE bulk directory enumeration and read the Apple attributes (max access, resource-fork
+// size, FinderInfo, UNIX mode) straight from each FileIdBothDirectoryInformation entry, instead of
+// opening every file plus its "._name" AppleDouble sidecar. That inline encoding is done in
+// AMBuildDirWire below; both halves must ship together or macOS is WORSE off (a listing whose EaSize
+// field reads back as zero tells Finder the user has no access to any file).
+#define AM_AAPL_SERVER_QUERY            1
+#define AM_AAPL_BIT_SERVER_CAPS         0x01
+#define AM_AAPL_BIT_VOLUME_CAPS         0x02
+#define AM_AAPL_BIT_MODEL_INFO          0x04
+#define AM_AAPL_CAP_READ_DIR_ATTR       0x01
+#define AM_AAPL_CAP_OSX_COPYFILE        0x02
+#define AM_AAPL_CAP_UNIX_BASED          0x04
+#define AM_AAPL_CAP_NFS_ACE             0x08
+
+// Find the data blob of the "AAPL" create context inside a CREATE request's context chain. Offsets in
+// each SMB2_CREATE_CONTEXT are relative to the start of that context. Returns NULL if not present.
+static const uint8_t * _Nullable AMFindAAPLContext(const uint8_t *buf, uint32_t len, uint32_t *outLen)
+{
+    uint32_t off = 0;
+    while (buf && off + 16 <= len) {
+        const uint8_t *ctx = buf + off;
+        uint32_t next = AMReadLE32(ctx + 0);
+        uint16_t noff = AMReadLE16(ctx + 4);
+        uint16_t nlen = AMReadLE16(ctx + 6);
+        uint16_t doff = AMReadLE16(ctx + 10);
+        uint32_t dlen = AMReadLE32(ctx + 12);
+        uint32_t span = next ? next : (len - off);
+        if (nlen == 4 && (uint32_t)noff + 4 <= span && memcmp(ctx + noff, "AAPL", 4) == 0 &&
+            (uint32_t)doff + dlen <= span) {
+            if (outLen) { *outLen = dlen; }
+            return ctx + doff;
+        }
+        if (next < 16 || off + next > len) { break; }
+        off += next;
+    }
+    return NULL;
+}
+
+// Build the full SMB2_CREATE_CONTEXT (header + "AAPL" name + server-query reply) to return in the CREATE
+// reply, or nil if the request is not a server-query we answer. Reports UNIX_BASED, plus READ_DIR_ATTR
+// when allowReadDirAttr is YES (passthrough mode only) — sets *outReadDirAttr accordingly.
+static NSData *_Nullable AMBuildAAPLReplyContext(const uint8_t *reqData, uint32_t reqLen,
+                                                 BOOL allowReadDirAttr, BOOL *outReadDirAttr)
+{
+    if (outReadDirAttr) { *outReadDirAttr = NO; }
+    if (reqLen < 24 || AMReadLE32(reqData + 0) != AM_AAPL_SERVER_QUERY) { return nil; }
+    uint64_t reqBitmap = AMReadLE64(reqData + 8);
+
+    // Reply payload: command(4) + reserved(4) + reply_bitmap(8) + optional caps blocks.
+    NSMutableData *payload = [NSMutableData dataWithLength:16];
+    uint8_t *pp = payload.mutableBytes;
+    AMWriteLE32(pp + 0, AM_AAPL_SERVER_QUERY);
+    uint64_t replyBitmap = 0;
+    if (reqBitmap & AM_AAPL_BIT_SERVER_CAPS) {
+        replyBitmap |= AM_AAPL_BIT_SERVER_CAPS;
+        uint64_t serverCaps = AM_AAPL_CAP_UNIX_BASED;
+        if (allowReadDirAttr) {
+            serverCaps |= AM_AAPL_CAP_READ_DIR_ATTR;
+            if (outReadDirAttr) { *outReadDirAttr = YES; }
+        }
+        uint8_t caps[8]; AMWriteLE64(caps, serverCaps);
+        [payload appendBytes:caps length:8];
+    }
+    if (reqBitmap & AM_AAPL_BIT_VOLUME_CAPS) {
+        replyBitmap |= AM_AAPL_BIT_VOLUME_CAPS;
+        uint8_t vcaps[8]; AMWriteLE64(vcaps, 0);   // not case-sensitive, no resolve-id, no full-sync
+        [payload appendBytes:vcaps length:8];
+    }
+    AMWriteLE64((uint8_t *)payload.mutableBytes + 8, replyBitmap);
+
+    // Wrap in a create context: header(16) + name "AAPL"(4) + pad(4) + data.
+    uint32_t dlen = (uint32_t)payload.length;
+    NSMutableData *ctx = [NSMutableData dataWithLength:24 + dlen];
+    uint8_t *p = ctx.mutableBytes;
+    AMWriteLE32(p + 0, 0);          // Next = 0 (only context)
+    p[4] = 16; p[5] = 0;            // NameOffset = 16
+    p[6] = 4;  p[7] = 0;            // NameLength = 4
+    p[10] = 24; p[11] = 0;          // DataOffset = 24
+    AMWriteLE32(p + 12, dlen);      // DataLength
+    memcpy(p + 16, "AAPL", 4);
+    memcpy(p + 24, payload.bytes, dlen);
+    return ctx;
+}
+
 static int am_create(struct smb2_server *srvr, struct smb2_context *smb2, struct smb2_create_request *req, struct smb2_create_reply *rep)
 {
     @autoreleasepool {
@@ -990,6 +1086,28 @@ static int am_create(struct smb2_server *srvr, struct smb2_context *smb2, struct
         rep->end_of_file = info.isDirectory ? 0 : info.fileSize;
         rep->file_attributes = AMAttributesFromInfo(info);
         memcpy(rep->file_id, fileId.bytes, SMB2_FD_SIZE);
+
+        // Apple SMB2 extension: if the client sent an "AAPL" create context, answer with our server
+        // capabilities. SUPPORTS_READ_DIR_ATTR is advertised only in passthrough (full-control) mode,
+        // where AMBuildDirWire below emits the Apple per-entry attributes; otherwise macOS would enable
+        // read-dir-attr and then mis-read the (unfilled) fields. Retained on the connection until the
+        // reply PDU is encoded, and remembered so the directory encoder knows to fill the attributes.
+        if (req->create_context && req->create_context_length) {
+            uint32_t aaplLen = 0;
+            const uint8_t *aapl = AMFindAAPLContext(req->create_context, req->create_context_length, &aaplLen);
+            if (aapl) {
+                BOOL readDirAttr = NO;
+                NSData *ctx = AMBuildAAPLReplyContext(aapl, aaplLen, server.fullControlEnabled, &readDirAttr);
+                if (ctx) {
+                    conn.pendingCreateContextData = ctx;
+                    rep->create_context = (uint8_t *)ctx.bytes;
+                    rep->create_context_length = (uint32_t)ctx.length;
+                    if (readDirAttr) { conn.aaplReadDirAttr = YES; }
+                    SMBSrvLog(@"AAPL create context -> UNIX_BASED%@ (%lu bytes)",
+                              readDirAttr ? @"|READ_DIR_ATTR" : @"", (unsigned long)ctx.length);
+                }
+            }
+        }
         return 0;
     }
 }
@@ -1430,7 +1548,7 @@ static size_t AMDirFixedSize(uint8_t infoClass)
 /// record alignment with correct NextEntryOffset chaining. Layouts follow
 /// MS-FSCC (cross-checked against libsmb2's own client-side decoders and the
 /// go-smb-server / SMBLibrary references).
-static NSData *_Nullable AMBuildDirWire(uint8_t infoClass, NSArray<AMSMB2FileInfo *> *entries, NSUInteger *ioCursor, uint32_t budget, BOOL singleEntry)
+static NSData *_Nullable AMBuildDirWire(uint8_t infoClass, NSArray<AMSMB2FileInfo *> *entries, NSUInteger *ioCursor, uint32_t budget, BOOL singleEntry, BOOL aaplReadDirAttr)
 {
     size_t fixed = AMDirFixedSize(infoClass);
     if (fixed == 0) {
@@ -1494,6 +1612,28 @@ static NSData *_Nullable AMBuildDirWire(uint8_t infoClass, NSArray<AMSMB2FileInf
                     if (nameLen) memcpy(p + 94, nameU16.bytes, nameLen);
                     break;
                 case SMB2_FILE_ID_BOTH_DIRECTORY_INFORMATION:
+                    // Apple read-dir-attr: when the client negotiated AAPL + SUPPORTS_READ_DIR_ATTR,
+                    // repurpose the otherwise-unused fields so macOS reads each entry's metadata inline
+                    // and stops probing every file (and its "._name" AppleDouble). Layout per the
+                    // Samba vfs_fruit SMB2/FIND extension:
+                    //   EaSize(@64)          <- maximal access granted (NOT 0: 0 = "no access")
+                    //   ShortNameLength(@68) <- 24 (the whole 24-byte ShortName area is the payload)
+                    //   ShortName[0..7]      <- resource-fork logical size (we have none -> 0)
+                    //   ShortName[8..23]     <- FinderInfo (we have none -> 0)
+                    //   Reserved2(@94, u16)  <- UNIX mode
+                    if (aaplReadDirAttr) {
+                        uint32_t maxAccess = info.isReadOnly ? 0x001200A9u   // FILE_GENERIC_READ | EXECUTE
+                                                             : 0x001F01FFu;  // FILE_ALL_ACCESS
+                        AMWriteLE32(p + 64, maxAccess);
+                        p[68] = 24;                 // ShortNameLength
+                        p[69] = 0;                  // Reserved
+                        AMWriteLE64(p + 70, 0);     // resource-fork size
+                        // p+78..p+93 FinderInfo (16 bytes) left zero
+                        uint16_t mode = info.isDirectory ? 0040755u
+                                        : (info.isReadOnly ? 0100444u : 0100644u);
+                        p[94] = (uint8_t)(mode & 0xff);
+                        p[95] = (uint8_t)((mode >> 8) & 0xff);
+                    }
                     AMWriteLE64(p + 96, fileId); // FileId (unique, non-zero)
                     if (nameLen) memcpy(p + 104, nameU16.bytes, nameLen);
                     break;
@@ -1589,7 +1729,7 @@ static int am_query_directory(struct smb2_server *srvr, struct smb2_context *smb
             // Passthrough mode: libsmb2 ships our bytes verbatim, so emit raw
             // wire records for the exact info class the client requested.
             NSUInteger cursor = file.dirCursor;
-            NSData *wire = AMBuildDirWire(req->file_information_class, entries, &cursor, budget, singleEntry);
+            NSData *wire = AMBuildDirWire(req->file_information_class, entries, &cursor, budget, singleEntry, conn.aaplReadDirAttr);
             file.dirCursor = cursor;
             if (!wire) {
                 rep->output_buffer = NULL;
@@ -1753,7 +1893,11 @@ static int am_query_info(struct smb2_server *srvr, struct smb2_context *smb2, st
                 }
                 case SMB2_FILE_FS_ATTRIBUTE_INFORMATION: {
                     struct smb2_file_fs_attribute_info *fs = calloc(1, sizeof(*fs));
-                    fs->filesystem_attributes = 0x02; // FILE_CASE_PRESERVED_NAMES
+                    // FILE_CASE_PRESERVED_NAMES(0x02) | FILE_UNICODE_ON_DISK(0x04) |
+                    // FILE_NAMED_STREAMS(0x00040000). macOS gates the Apple read-dir-attr fast path on
+                    // the share reporting named-streams support here (matches Samba's fs_capabilities &
+                    // FILE_NAMED_STREAMS check), so advertise it alongside the AAPL create-context reply.
+                    fs->filesystem_attributes = 0x00040006;
                     fs->maximum_component_name_length = 255;
                     fs->filesystem_name = (uint8_t *)"AMSMB2";
                     fs->filesystem_name_length = (uint32_t)strlen((char *)fs->filesystem_name);
