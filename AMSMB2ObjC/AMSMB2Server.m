@@ -362,6 +362,9 @@ static void am_on_error(struct smb2_context *smb2, const char *error_string);
     BOOL _running;
 }
 
+// Custom `shareName` getter (below) means the readonly property no longer auto-synthesizes its ivar.
+@synthesize shareName = _shareName;
+
 - (instancetype)initWithPort:(uint16_t)port shareName:(NSString *)shareName delegate:(nullable id<AMSMB2ServerDelegate>)delegate
 {
     if ((self = [super init])) {
@@ -381,6 +384,13 @@ static void am_on_error(struct smb2_context *smb2, const char *error_string);
 - (void)dealloc
 {
     [self stop];
+}
+
+// Default the share name in ONE place so callers (and the srvsvc share-enum / getinfo responders) can
+// use `shareName` directly without repeating a `?: @"Share"` fallback.
+- (NSString *)shareName
+{
+    return _shareName.length ? _shareName : @"Share";
 }
 
 - (BOOL)isRunning
@@ -765,7 +775,7 @@ static NSData *AMBuildFault(uint32_t callId, uint16_t contextId, uint32_t status
 static NSData *_Nullable AMBuildShareEnumResponse(AMSMB2Server *server, struct smb2_context *smb2,
                                                   uint32_t callId, uint16_t contextId)
 {
-    NSString *shareName = server.shareName.length ? server.shareName : @"Share";
+    NSString *shareName = server.shareName;
     const char *names[2] = { shareName.UTF8String, "IPC$" };
     uint32_t types[2] = {
         SRVSVC_SHARE_TYPE_DISKTREE,
@@ -786,7 +796,7 @@ static NSData *_Nullable AMBuildShareEnumResponse(AMSMB2Server *server, struct s
 static NSData *_Nullable AMBuildShareGetInfoResponse(AMSMB2Server *server, struct smb2_context *smb2,
                                                      uint32_t callId, uint16_t contextId)
 {
-    NSString *shareName = server.shareName.length ? server.shareName : @"Share";
+    NSString *shareName = server.shareName;
     uint8_t buf[8192];
     int n = smb2_srvsvc_server_netsharegetinfo(smb2, callId, contextId,
                                                shareName.UTF8String, SRVSVC_SHARE_TYPE_DISKTREE,
