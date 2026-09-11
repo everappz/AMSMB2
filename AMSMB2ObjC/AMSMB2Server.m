@@ -1172,6 +1172,31 @@ static int am_flush(struct smb2_server *srvr, struct smb2_context *smb2, struct 
 
 #pragma mark - C handlers: read / write
 
+// A handler normally returns 0 (libsmb2 sends the filled reply) or <0 (libsmb2 sends
+// STATUS_NOT_IMPLEMENTED). A POSITIVE return means "this handler already queued its own reply PDU,
+// so libsmb2 must send nothing else" — libsmb2's *_request_cb dispatchers only act on 0 / negative
+// returns, so a positive return leaves our self-queued reply as the sole response. This lets the
+// server layer emit a status libsmb2's reply structs cannot express, WITHOUT patching the vendored
+// libsmb2 sources.
+#define AM_HANDLER_REPLY_SENT 1
+
+// Reply to the in-flight SMB2 READ with STATUS_END_OF_FILE. Required because the read reply struct
+// has no status field: a read that lands at or past EOF returns zero bytes, and a zero-length
+// STATUS_SUCCESS read makes macOS SMBClient re-issue the SAME read forever (infinite loop: Finder
+// hangs and the Mac needs a restart while it reads past EOF building thumbnails / Spotlight-indexing
+// media files). MS-SMB2 3.3.5.12 requires STATUS_END_OF_FILE here, so emit it in the server layer.
+static void AMReplyReadEndOfFile(struct smb2_context *smb2)
+{
+    struct smb2_error_reply erep;
+    memset(&erep, 0, sizeof(erep));
+    struct smb2_pdu *pdu = smb2_cmd_error_reply_async(smb2, &erep, SMB2_READ,
+                                                      SMB2_STATUS_END_OF_FILE, NULL, NULL);
+    if (pdu) {
+        smb2_set_pdu_message_id(smb2, pdu, smb2_get_last_request_message_id(smb2));
+        smb2_queue_pdu(smb2, pdu);
+    }
+}
+
 static int am_read(struct smb2_server *srvr, struct smb2_context *smb2, struct smb2_read_request *req, struct smb2_read_reply *rep)
 {
     @autoreleasepool {
@@ -1211,7 +1236,20 @@ static int am_read(struct smb2_server *srvr, struct smb2_context *smb2, struct s
         NSError *err = nil;
         NSData *data = [delegate server:server readFromItem:file.handle offset:req->offset length:req->length error:&err];
         if (!data) {
+            SMBSrvLog(@"read '%@' offset=%llu length=%u -> delegate FAILED: %@",
+                      file.info.name ?: file.path, (unsigned long long)req->offset, req->length,
+                      err ?: @"(nil error)");
             return -1;
+        }
+
+        // A zero-byte read for a non-zero request means the offset is at/past EOF. Answer with
+        // STATUS_END_OF_FILE (emitted here in the server layer, see AMReplyReadEndOfFile): a
+        // zero-length SUCCESS read makes macOS re-issue the same read forever.
+        if (req->length > 0 && data.length == 0) {
+            SMBSrvLog(@"read '%@' offset=%llu length=%u -> 0 bytes (EOF -> STATUS_END_OF_FILE)",
+                      file.info.name ?: file.path, (unsigned long long)req->offset, req->length);
+            AMReplyReadEndOfFile(smb2);
+            return AM_HANDLER_REPLY_SENT;
         }
 
         rep->data_offset = 0;
@@ -1259,7 +1297,15 @@ static int am_write(struct smb2_server *srvr, struct smb2_context *smb2, struct 
         NSError *err = nil;
         NSInteger written = [delegate server:server writeToItem:file.handle offset:req->offset data:data error:&err];
         if (written < 0) {
+            SMBSrvLog(@"write '%@' offset=%llu length=%u -> delegate FAILED: %@",
+                      file.info.name ?: file.path, (unsigned long long)req->offset, req->length,
+                      err ?: @"(nil error)");
             return -1;
+        }
+        if ((uint32_t)written != req->length) {
+            SMBSrvLog(@"write '%@' offset=%llu SHORT WRITE: asked=%u wrote=%ld",
+                      file.info.name ?: file.path, (unsigned long long)req->offset,
+                      req->length, (long)written);
         }
 
         // Keep cached size in sync so subsequent QUERY_INFO reflects the write.
