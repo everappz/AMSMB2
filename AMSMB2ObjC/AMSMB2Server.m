@@ -196,6 +196,31 @@ static NSString *AMPathFromCName(const char *_Nullable cname)
     return [s stringByReplacingOccurrencesOfString:@"\\" withString:@"/"];
 }
 
+/// Split an SMB2 alternate-data-stream suffix off a share-relative path. The SMB2 Name field encodes
+/// a stream as `path:streamname:streamtype` (e.g. `Song.mp3:AFP_AfpInfo:$DATA`). The unnamed default
+/// data stream (`path` or `path::$DATA`) IS the file itself, so it is stripped and reported as no
+/// stream. Returns the base path (stream suffix removed); *outStream gets the alternate stream name,
+/// or nil when the request addresses the file's main data. Only the last path component is inspected
+/// (SMB reserves `:` for streams, so it never appears in a real name).
+static NSString *AMBasePathStrippingStream(NSString *path, NSString * _Nullable * _Nullable outStream)
+{
+    if (outStream) { *outStream = nil; }
+    NSRange lastSlash = [path rangeOfString:@"/" options:NSBackwardsSearch];
+    NSUInteger compStart = (lastSlash.location == NSNotFound) ? 0 : lastSlash.location + 1;
+    NSRange colon = [path rangeOfString:@":" options:0 range:NSMakeRange(compStart, path.length - compStart)];
+    if (colon.location == NSNotFound) {
+        return path;
+    }
+    NSString *base = [path substringToIndex:colon.location];
+    NSString *rest = [path substringFromIndex:colon.location + 1]; // "streamname[:streamtype]"
+    NSRange typeColon = [rest rangeOfString:@":"];
+    NSString *streamName = (typeColon.location == NSNotFound) ? rest : [rest substringToIndex:typeColon.location];
+    if (streamName.length > 0 && outStream) {
+        *outStream = streamName; // a genuine alternate stream (AFP_AfpInfo, com.apple.*, ...)
+    }
+    return base; // "" streamName means the default `::$DATA` data stream -> the base file
+}
+
 #pragma mark - AMSMB2FileInfo
 
 @implementation AMSMB2FileInfo
@@ -235,6 +260,15 @@ static NSString *AMPathFromCName(const char *_Nullable cname)
 @property (nonatomic) BOOL isPipe;
 @property (nonatomic, nullable, copy) NSString *pipeName;
 @property (nonatomic, nullable, strong) NSMutableData *pipeReadBuffer;
+// SMB2 alternate-data-stream state: a CREATE of `file:AFP_AfpInfo` (or any `file:streamname`) is an
+// alternate data stream, NOT a delegate file. macOS/Finder writes Finder metadata to the AFP_AfpInfo
+// stream on every upload (it is advertised via FILE_NAMED_STREAMS, which the AAPL fast listing needs).
+// We do not persist Apple metadata, so such streams are served from this in-memory buffer and never
+// reach the delegate: without this the `:streamname` suffix is taken as a real filename, creating junk
+// `file:AFP_AfpInfo` entries and failing uploads with error -50 (and looping Finder on delete).
+@property (nonatomic) BOOL isStream;
+@property (nonatomic, nullable, copy) NSString *streamName;
+@property (nonatomic, nullable, strong) NSMutableData *streamBuffer;
 @end
 
 @implementation AMSMB2ServerOpenFile
@@ -1034,6 +1068,46 @@ static int am_create(struct smb2_server *srvr, struct smb2_context *smb2, struct
             return 0;
         }
 
+        // SMB2 alternate data stream (`file:AFP_AfpInfo`, resource fork, `com.apple.*`, ...). Finder
+        // writes Finder metadata to these on every upload because the share advertises
+        // FILE_NAMED_STREAMS (needed by the AAPL fast listing). We do not persist Apple metadata, so a
+        // stream is served from an in-memory per-handle buffer and NEVER forwarded to the delegate. If
+        // it were, the `:streamname` suffix would be treated as a real filename: junk `file:AFP_AfpInfo`
+        // entries, uploads failing with error -50, and Finder looping on delete. The unnamed default
+        // data stream (`file::$DATA`) is stripped by AMBasePathStrippingStream and falls through as the
+        // normal file.
+        NSString *streamName = nil;
+        path = AMBasePathStrippingStream(path, &streamName);
+        if (streamName) {
+            AMSMB2ServerOpenFile *sfile = [[AMSMB2ServerOpenFile alloc] init];
+            sfile.isStream = YES;
+            sfile.streamName = streamName;
+            sfile.path = path;
+            sfile.streamBuffer = [NSMutableData data];
+            sfile.info = [AMSMB2FileInfo fileInfoWithName:path.lastPathComponent isDirectory:NO size:0];
+
+            NSData *streamId = nil;
+            {
+                uint8_t idbuf[SMB2_FD_SIZE];
+                memset(idbuf, 0, sizeof(idbuf));
+                uint64_t n = ++conn->_counter;
+                memcpy(idbuf, &n, sizeof(n));
+                memcpy(idbuf + 8, &conn->_salt, sizeof(conn->_salt));
+                streamId = [NSData dataWithBytes:idbuf length:SMB2_FD_SIZE];
+            }
+            conn.openFiles[streamId] = sfile;
+            conn.lastFileId = streamId;
+
+            memset(rep, 0, sizeof(*rep));
+            rep->oplock_level = SMB2_OPLOCK_LEVEL_NONE;
+            rep->create_action = (req->create_disposition == SMB2_FILE_CREATE) ? 2 /* FILE_CREATED */ : 1 /* FILE_OPENED */;
+            rep->file_attributes = SMB2_FILE_ATTRIBUTE_NORMAL;
+            memcpy(rep->file_id, streamId.bytes, SMB2_FD_SIZE);
+            SMBSrvLog(@"create stream '%@:%@' -> virtual (in-memory, not persisted)",
+                      path.lastPathComponent, streamName);
+            return 0;
+        }
+
         AMSMB2FileInfo *info = nil;
         NSError *err = nil;
         id handle = [delegate server:server
@@ -1130,12 +1204,18 @@ static int am_close(struct smb2_server *srvr, struct smb2_context *smb2, struct 
                 SMBSrvLog(@"close pipe '%@' (passthrough restored to %@)",
                           file.pipeName, server.fullControlEnabled ? @"on" : @"off");
             }
-            if (file.deleteOnClose && [delegate respondsToSelector:@selector(server:deleteItem:error:)]) {
-                NSError *err = nil;
-                [delegate server:server deleteItem:file.handle error:&err];
-            }
-            if (file.handle && [delegate respondsToSelector:@selector(server:closeItem:)]) {
-                [delegate server:server closeItem:file.handle];
+            // Virtual alternate-data-stream handle: nothing was persisted and there is no delegate
+            // handle, so skip the delegate delete/close entirely (its buffer is freed with the object).
+            if (file.isStream) {
+                SMBSrvLog(@"close stream '%@:%@'", file.info.name ?: file.path, file.streamName);
+            } else {
+                if (file.deleteOnClose && [delegate respondsToSelector:@selector(server:deleteItem:error:)]) {
+                    NSError *err = nil;
+                    [delegate server:server deleteItem:file.handle error:&err];
+                }
+                if (file.handle && [delegate respondsToSelector:@selector(server:closeItem:)]) {
+                    [delegate server:server closeItem:file.handle];
+                }
             }
             AMSMB2FileInfo *info = file.info;
             rep->creation_time = AMWinTimeFromDate(info.creationDate);
@@ -1233,6 +1313,29 @@ static int am_read(struct smb2_server *srvr, struct smb2_context *smb2, struct s
             return 0;
         }
 
+        // Alternate data stream: serve from the in-memory buffer, offset-addressed like a file. A read
+        // at/past the buffer end returns STATUS_END_OF_FILE (same rule as the file path below).
+        if (file.isStream) {
+            NSData *sbuf = file.streamBuffer ?: [NSData data];
+            if (req->length > 0 && (unsigned long long)req->offset >= sbuf.length) {
+                SMBSrvLog(@"read stream '%@:%@' offset=%llu -> EOF", file.info.name ?: file.path,
+                          file.streamName, (unsigned long long)req->offset);
+                AMReplyReadEndOfFile(smb2);
+                return AM_HANDLER_REPLY_SENT;
+            }
+            uint32_t n = (uint32_t)MIN((NSUInteger)req->length, sbuf.length - (NSUInteger)req->offset);
+            rep->data_offset = 0;
+            rep->data_remaining = 0;
+            rep->data_length = n;
+            rep->data = NULL;
+            if (n > 0) {
+                rep->data = malloc(n);
+                if (!rep->data) { return -1; }
+                memcpy(rep->data, (const uint8_t *)sbuf.bytes + (NSUInteger)req->offset, n);
+            }
+            return 0;
+        }
+
         NSError *err = nil;
         NSData *data = [delegate server:server readFromItem:file.handle offset:req->offset length:req->length error:&err];
         if (!data) {
@@ -1290,6 +1393,28 @@ static int am_write(struct smb2_server *srvr, struct smb2_context *smb2, struct 
             rep->remaining = 0;
             SMBSrvLog(@"pipe '%@' WRITE %u bytes -> %lu response queued",
                       file.pipeName, req->length, (unsigned long)file.pipeReadBuffer.length);
+            return 0;
+        }
+
+        // Alternate data stream (AFP_AfpInfo Finder-info write on upload, etc.): accept into the
+        // in-memory buffer and report success WITHOUT persisting. Apple's SMBClient does a
+        // Create(FILE_OPEN_IF)+Write(60 bytes)+Close for the FinderInfo stream and fails the whole copy
+        // (Finder error -50) if the write or close returns a hard error, so this MUST succeed.
+        if (file.isStream) {
+            NSMutableData *sbuf = file.streamBuffer ?: (file.streamBuffer = [NSMutableData data]);
+            unsigned long long end = req->offset + (unsigned long long)req->length;
+            if (end > sbuf.length) {
+                [sbuf increaseLengthBy:(NSUInteger)(end - sbuf.length)];
+            }
+            if (req->length > 0 && req->buf) {
+                memcpy((uint8_t *)sbuf.mutableBytes + (NSUInteger)req->offset, req->buf, req->length);
+            }
+            file.info.fileSize = sbuf.length;
+            rep->count = req->length;
+            rep->remaining = 0;
+            SMBSrvLog(@"write stream '%@:%@' offset=%llu length=%u -> accepted (discarded on close)",
+                      file.info.name ?: file.path, file.streamName,
+                      (unsigned long long)req->offset, req->length);
             return 0;
         }
 
@@ -1826,7 +1951,8 @@ static int am_query_info(struct smb2_server *srvr, struct smb2_context *smb2, st
         AMSMB2ServerOpenFile *file = AMFileForId(conn, req->file_id);
 
         AMSMB2FileInfo *info = file.info;
-        if (file && [delegate respondsToSelector:@selector(server:infoForItem:error:)]) {
+        // Virtual stream handles have no delegate item; their info (size = buffer length) is authoritative.
+        if (file && !file.isStream && [delegate respondsToSelector:@selector(server:infoForItem:error:)]) {
             NSError *err = nil;
             AMSMB2FileInfo *fresh = [delegate server:server infoForItem:file.handle error:&err];
             if (fresh) {
@@ -2037,6 +2163,28 @@ static int am_set_info(struct smb2_server *srvr, struct smb2_context *smb2, stru
         if (!file) {
             return -1;
         }
+
+        // Virtual alternate data stream: apply metadata sets in-memory, never to the delegate. Honor a
+        // set-end-of-file (Finder pre-sizes the AFP_AfpInfo stream) so a follow-up read is consistent;
+        // accept everything else (rename / basic / disposition / allocation) as a no-op so the upload
+        // does not fail.
+        if (file.isStream) {
+            const uint8_t *sbufIn = (const uint8_t *)req->input_data;
+            if (req->info_type == SMB2_0_INFO_FILE &&
+                req->file_info_class == SMB2_FILE_END_OF_FILE_INFORMATION &&
+                sbufIn && req->buffer_length >= 8) {
+                uint64_t eof = AMReadLE64(sbufIn);
+                NSMutableData *sbuf = file.streamBuffer ?: (file.streamBuffer = [NSMutableData data]);
+                [sbuf setLength:(NSUInteger)eof];
+                file.info.fileSize = sbuf.length;
+            } else if (req->info_type == SMB2_0_INFO_FILE &&
+                       req->file_info_class == SMB2_FILE_DISPOSITION_INFORMATION &&
+                       sbufIn && req->buffer_length >= 1) {
+                file.deleteOnClose = sbufIn[0] != 0;
+            }
+            return 0;
+        }
+
         if (req->info_type != SMB2_0_INFO_FILE) {
             return 0; // accept filesystem/security sets as no-ops
         }
