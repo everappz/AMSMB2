@@ -25,7 +25,13 @@ typedef struct {
 } SMB2CBData;
 
 static void smb2_generic_handler(struct smb2_context *smb2, int status, void *command_data, void *cbdata) {
-    if (!smb2 || smb2_get_fd(smb2) < 0) return;
+    // NOTE: do NOT gate on smb2_get_fd(smb2) < 0. libsmb2's connect/session-setup ERROR paths call
+    // smb2_close_context() (which closes the fd) BEFORE invoking this completion callback, so a closed
+    // fd is the NORMAL state when reporting an auth/signing failure. Bailing out here dropped the real
+    // status: cb->isFinished never got set, waitForReply span until it noticed fd < 0, and the failure
+    // surfaced as a stale errno (EINPROGRESS / 36) instead of the actual reason. cbdata is the caller's
+    // stack SMB2CBData, valid for the whole waitForReply, so recording the result here is safe.
+    if (!smb2) return;
     SMB2CBData *cb = (SMB2CBData *)cbdata;
     if (!cb) return;
     if (status != 0) {
