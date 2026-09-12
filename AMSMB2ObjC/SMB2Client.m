@@ -390,7 +390,16 @@ static void smb2_generic_handler(struct smb2_context *smb2, int status, void *co
 }
 
 - (BOOL)disconnectWithError:(NSError **)error {
-    // Match Swift behavior: swallow disconnect errors (connection may already be gone).
+    // Graceful disconnect: TREE_DISCONNECT then LOGOFF, so the server drops the session
+    // immediately instead of waiting for it to time out. libsmb2 chains these (the LOGOFF
+    // is queued only from the TREE_DISCONNECT reply callback), so the socket MUST be
+    // serviced for the LOGOFF to be sent at all; there is no "send without reading a
+    // reply" here. Servicing means libsmb2's reply parser runs, and a stray/duplicate
+    // reply left from the just-finished operation can arrive with no matching PDU. That
+    // used to crash the parser (NULL-PDU deref in smb2_is_error_response); libsmb2 now
+    // guards it and returns an error instead, which smb2_service surfaces as < 0 ->
+    // waitForReply tears the context down cleanly. Either way we swallow the error
+    // (the connection may already be gone), matching the Swift behavior.
     [self asyncAwait:^int32_t(struct smb2_context *context, void *cbPtr) {
         return smb2_disconnect_share_async(context, smb2_generic_handler, cbPtr);
     } error:nil];
