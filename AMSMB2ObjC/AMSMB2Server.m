@@ -344,6 +344,7 @@ static int am_destruction_event(struct smb2_server *srvr, struct smb2_context *s
 
 static void am_on_new_client(struct smb2_context *smb2, void *cb_data);
 static void am_on_error(struct smb2_context *smb2, const char *error_string);
+static NSString *_Nullable AMPeerAddressForContext(struct smb2_context *smb2);
 
 #pragma mark - AMSMB2Server
 
@@ -639,6 +640,13 @@ static int am_authorize_user(struct smb2_server *srvr, struct smb2_context *smb2
         NSString *wsStr = (workstation && workstation[0]) ? [NSString stringWithUTF8String:workstation] : nil;
 
         id<AMSMB2ServerDelegate> delegate = server.delegate;
+        // Surface the client's computer name / user (SMB's closest thing to a User-Agent) so the app can
+        // label the connection. Fired for anonymous and authenticated sessions alike.
+        if ((wsStr.length || userStr.length) &&
+            [delegate respondsToSelector:@selector(server:clientDidIdentifyFromAddress:workstation:user:)]) {
+            [delegate server:server clientDidIdentifyFromAddress:AMPeerAddressForContext(smb2)
+                                                    workstation:wsStr user:userStr];
+        }
         if ([delegate respondsToSelector:@selector(server:authenticateUser:domain:workstation:)]) {
             if (![delegate server:server authenticateUser:userStr domain:domainStr workstation:wsStr]) {
                 return -1;
@@ -2348,6 +2356,18 @@ static void am_on_new_client(struct smb2_context *smb2, void *cb_data)
 {
     @autoreleasepool {
         AMSMB2Server *server = (__bridge AMSMB2Server *)cb_data;
+        NSString *peer = AMPeerAddressForContext(smb2);
+        id<AMSMB2ServerDelegate> delegate = server.delegate;
+
+        // Blocked device? Drop the connection BEFORE any protocol exchange, and don't register it (so it
+        // never appears as connected). The serve loop culls a context whose socket is closed, invoking
+        // destruction_event; removeConnectionForContext: no-ops since we never added a connection.
+        if ([delegate respondsToSelector:@selector(server:shouldAcceptClientFromAddress:)] &&
+            ![delegate server:server shouldAcceptClientFromAddress:peer]) {
+            smb2_close_context(smb2);
+            return;
+        }
+
         smb2_set_version(smb2, SMB2_VERSION_ANY);
         smb2_register_error_callback(smb2, am_on_error);
         if (server.fullControlEnabled) {
@@ -2357,9 +2377,7 @@ static void am_on_new_client(struct smb2_context *smb2, void *cb_data)
         AMSMB2ServerConnection *conn = [server connectionForContext:smb2 create:YES];
         // Record the peer at connect (the socket is still up) and tell the delegate. Stored on the
         // connection so the disconnect callback (removeConnectionForContext:) reports the same address.
-        NSString *peer = AMPeerAddressForContext(smb2);
         conn.peerAddress = peer;
-        id<AMSMB2ServerDelegate> delegate = server.delegate;
         if (peer.length && [delegate respondsToSelector:@selector(server:clientDidConnectFromAddress:)]) {
             [delegate server:server clientDidConnectFromAddress:peer];
         }

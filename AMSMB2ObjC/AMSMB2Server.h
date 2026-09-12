@@ -144,6 +144,12 @@ typedef NS_ENUM(NSInteger, AMSMB2CreateDisposition) {
 
 #pragma mark Connection lifecycle
 
+/// Asked once per new TCP connection, before any protocol exchange, whether to accept the client at
+/// `address` (the peer IP, or nil if it can't be determined). Return NO to drop the connection immediately
+/// (e.g. a blocked device). If not implemented, all connections are accepted. Called on the serve queue.
+/// Optional.
+- (BOOL)server:(AMSMB2Server *)server shouldAcceptClientFromAddress:(nullable NSString *)address;
+
 /// A client TCP connection was accepted (before authentication). `address` is the peer IP (IPv4 or IPv6),
 /// or nil when it can't be determined. Pairs 1:1 with `server:clientDidDisconnectFromAddress:` (the same
 /// address is reported at disconnect). Called on the server's serve queue. Optional.
@@ -152,6 +158,15 @@ typedef NS_ENUM(NSInteger, AMSMB2CreateDisposition) {
 /// A client connection was torn down. `address` is the same peer IP reported at connect. Called on the
 /// server's serve queue. Optional.
 - (void)server:(AMSMB2Server *)server clientDidDisconnectFromAddress:(nullable NSString *)address;
+
+/// A client identified itself during SMB session-setup. `workstation` is the client's computer name from the
+/// NTLM authenticate message (SMB has no HTTP-style User-Agent, so this is the best human-readable client
+/// label); `user` is the account name (nil/empty for anonymous/guest). `address` is the peer IP. Any may be
+/// nil, and it may not be sent at all (e.g. some anonymous connections). Called on the serve queue. Optional.
+- (void)server:(AMSMB2Server *)server
+    clientDidIdentifyFromAddress:(nullable NSString *)address
+                     workstation:(nullable NSString *)workstation
+                            user:(nullable NSString *)user;
 
 #pragma mark Authentication
 
