@@ -288,6 +288,9 @@ static NSString *AMBasePathStrippingStream(NSString *path, NSString * _Nullable 
 // "compound_file_id" sentinel that follow-on commands in a compound request
 // (CREATE+SET_INFO+CLOSE, CREATE+QUERY_INFO+CLOSE, …) carry.
 @property (nonatomic, nullable, strong) NSData *lastFileId;
+// Peer IP captured at connect (via getpeername), so the same address is reported at disconnect (when the
+// socket may already be closed). Used only for the client-lifecycle delegate callbacks.
+@property (nonatomic, nullable, copy) NSString *peerAddress;
 // Retains the raw wire buffer handed to libsmb2 in passthrough directory
 // listings until the reply is encoded (replaced on the next query).
 @property (nonatomic, nullable, strong) NSData *pendingDirData;
@@ -549,8 +552,13 @@ static void am_on_error(struct smb2_context *smb2, const char *error_string);
     if (!conn) {
         return;
     }
-    // Release any handles the client left open and free scratch buffers.
     id<AMSMB2ServerDelegate> delegate = self.delegate;
+    // Tell the delegate the client went away (same address recorded at connect). Only when we reported the
+    // connect, so add/remove stay 1:1.
+    if (conn.peerAddress.length && [delegate respondsToSelector:@selector(server:clientDidDisconnectFromAddress:)]) {
+        [delegate server:self clientDidDisconnectFromAddress:conn.peerAddress];
+    }
+    // Release any handles the client left open and free scratch buffers.
     for (AMSMB2ServerOpenFile *file in conn.openFiles.allValues) {
         if (file.handle && [delegate respondsToSelector:@selector(server:closeItem:)]) {
             [delegate server:self closeItem:file.handle];
@@ -2305,6 +2313,37 @@ static void am_on_error(struct smb2_context *smb2, const char *error_string)
     (void)error_string;
 }
 
+// The connected client's peer IP (IPv4 or IPv6), read from the connection's socket via getpeername(). nil
+// if it can't be determined. smb2_get_fd() is public libsmb2 API, so no library change is needed.
+static NSString *_Nullable AMPeerAddressForContext(struct smb2_context *smb2)
+{
+    if (!smb2) {
+        return nil;
+    }
+    int fd = (int)smb2_get_fd(smb2);
+    if (fd < 0) {
+        return nil;
+    }
+    struct sockaddr_storage ss;
+    socklen_t len = sizeof(ss);
+    if (getpeername(fd, (struct sockaddr *)&ss, &len) != 0) {
+        return nil;
+    }
+    char buf[INET6_ADDRSTRLEN] = {0};
+    if (ss.ss_family == AF_INET) {
+        if (!inet_ntop(AF_INET, &((struct sockaddr_in *)&ss)->sin_addr, buf, sizeof(buf))) {
+            return nil;
+        }
+    } else if (ss.ss_family == AF_INET6) {
+        if (!inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&ss)->sin6_addr, buf, sizeof(buf))) {
+            return nil;
+        }
+    } else {
+        return nil;
+    }
+    return buf[0] ? [NSString stringWithUTF8String:buf] : nil;
+}
+
 static void am_on_new_client(struct smb2_context *smb2, void *cb_data)
 {
     @autoreleasepool {
@@ -2315,7 +2354,15 @@ static void am_on_new_client(struct smb2_context *smb2, void *cb_data)
             // Required so libsmb2 accepts SET_INFO (rename/disposition/EOF/basic).
             smb2_set_passthrough(smb2, 1);
         }
-        [server connectionForContext:smb2 create:YES];
+        AMSMB2ServerConnection *conn = [server connectionForContext:smb2 create:YES];
+        // Record the peer at connect (the socket is still up) and tell the delegate. Stored on the
+        // connection so the disconnect callback (removeConnectionForContext:) reports the same address.
+        NSString *peer = AMPeerAddressForContext(smb2);
+        conn.peerAddress = peer;
+        id<AMSMB2ServerDelegate> delegate = server.delegate;
+        if (peer.length && [delegate respondsToSelector:@selector(server:clientDidConnectFromAddress:)]) {
+            [delegate server:server clientDidConnectFromAddress:peer];
+        }
     }
 }
 

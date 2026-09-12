@@ -142,6 +142,17 @@ typedef NS_ENUM(NSInteger, AMSMB2CreateDisposition) {
 
 @optional
 
+#pragma mark Connection lifecycle
+
+/// A client TCP connection was accepted (before authentication). `address` is the peer IP (IPv4 or IPv6),
+/// or nil when it can't be determined. Pairs 1:1 with `server:clientDidDisconnectFromAddress:` (the same
+/// address is reported at disconnect). Called on the server's serve queue. Optional.
+- (void)server:(AMSMB2Server *)server clientDidConnectFromAddress:(nullable NSString *)address;
+
+/// A client connection was torn down. `address` is the same peer IP reported at connect. Called on the
+/// server's serve queue. Optional.
+- (void)server:(AMSMB2Server *)server clientDidDisconnectFromAddress:(nullable NSString *)address;
+
 #pragma mark Authentication
 
 /// Authorize a session. `user` is `nil` for an anonymous attempt. Return `YES`
