@@ -291,6 +291,9 @@ static NSString *AMBasePathStrippingStream(NSString *path, NSString * _Nullable 
 // Peer IP captured at connect (via getpeername), so the same address is reported at disconnect (when the
 // socket may already be closed). Used only for the client-lifecycle delegate callbacks.
 @property (nonatomic, nullable, copy) NSString *peerAddress;
+// The connection's socket fd, captured at connect, so -disconnectClientsFromAddress: can shutdown() it from
+// another thread (e.g. when the app blocks the device) to force the serve loop to tear it down.
+@property (nonatomic) int socketFD;
 // Retains the raw wire buffer handed to libsmb2 in passthrough directory
 // listings until the reply is encoded (replaced on the next query).
 @property (nonatomic, nullable, strong) NSData *pendingDirData;
@@ -540,6 +543,27 @@ static NSString *_Nullable AMPeerAddressForContext(struct smb2_context *smb2);
     }
     [_lock unlock];
     return conn;
+}
+
+- (NSUInteger)disconnectClientsFromAddress:(nullable NSString *)address
+{
+    if (address.length == 0) {
+        return 0;
+    }
+    NSUInteger dropped = 0;
+    // Under _lock so a connection can't be removed/destroyed (removeConnectionForContext: also takes _lock)
+    // while we read its fd. shutdown() only half-closes the socket from this thread; the serve loop notices
+    // on its next pass and destroys the context (firing destruction_event -> the disconnect delegate). We do
+    // NOT close()/smb2_destroy_context here, since libsmb2 contexts are owned by the serve thread.
+    [_lock lock];
+    for (AMSMB2ServerConnection *conn in _connections.allValues) {
+        if (conn.socketFD > 0 && [conn.peerAddress isEqualToString:address]) {
+            shutdown(conn.socketFD, SHUT_RDWR);
+            dropped++;
+        }
+    }
+    [_lock unlock];
+    return dropped;
 }
 
 - (void)removeConnectionForContext:(struct smb2_context *)smb2
@@ -2378,6 +2402,7 @@ static void am_on_new_client(struct smb2_context *smb2, void *cb_data)
         // Record the peer at connect (the socket is still up) and tell the delegate. Stored on the
         // connection so the disconnect callback (removeConnectionForContext:) reports the same address.
         conn.peerAddress = peer;
+        conn.socketFD = (int)smb2_get_fd(smb2);
         if (peer.length && [delegate respondsToSelector:@selector(server:clientDidConnectFromAddress:)]) {
             [delegate server:server clientDidConnectFromAddress:peer];
         }

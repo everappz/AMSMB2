@@ -327,6 +327,11 @@ createSymbolicLinkAtItem:(id)handle
 /// has exited. Safe to call when not running.
 - (void)stop;
 
+/// Force-drop every ACTIVE connection whose peer IP equals `address` (e.g. a device the app just blocked).
+/// Thread-safe: it shutdown()s the matching socket(s), which wakes the serve loop to tear the connection(s)
+/// down through the normal path (firing the disconnect delegate). Returns how many were dropped.
+- (NSUInteger)disconnectClientsFromAddress:(nullable NSString *)address;
+
 @end
 
 NS_ASSUME_NONNULL_END
