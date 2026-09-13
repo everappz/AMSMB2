@@ -173,7 +173,13 @@ static void smb2_generic_handler(struct smb2_context *smb2, int status, void *co
     [_contextLock lock];
     _password = [password copy];
     if (_context) {
-        smb2_set_password(_context, password.length > 0 ? [password UTF8String] : NULL);
+        // Distinguish nil from empty-string, because libsmb2 uses it to pick the auth MODE:
+        //   nil  -> NULL  -> ANONYMOUS / null session (drops the username, NTLMSSP_NEGOTIATE_ANONYMOUS)
+        //   @""  -> ""    -> NAMED login with an empty password (e.g. "guest", like macOS kSMBAuthTypeGuest)
+        //   @"x" -> "x"   -> normal authenticated login
+        // Do NOT collapse @"" to NULL: that turned every guest attempt into an anonymous null session,
+        // which servers like Synology reject even when they allow the named guest account.
+        smb2_set_password(_context, password != nil ? [password UTF8String] : NULL);
     }
     [_contextLock unlock];
 }
@@ -319,11 +325,20 @@ static void smb2_generic_handler(struct smb2_context *smb2, int status, void *co
         }
 
         if (cb.result != 0) {
-            // High-level libsmb2 async functions pass negated POSIX errno (not NT status).
+            // High-level libsmb2 async functions (e.g. smb2_connect_share_async) hand the callback a
+            // negated POSIX errno, which loses the real reason. libsmb2 also stashes the raw NT_STATUS on
+            // the context (smb2_set_nterror), so prefer that: it lets the client see the exact server
+            // reason (e.g. STATUS_LOGON_FAILURE 0xC000006D) via SMB2NTStatusErrorKey, instead of a generic
+            // EACCES. Read it BEFORE the context can be torn down.
             NSString *errStr = smb2_get_error(_context)
                 ? [NSString stringWithUTF8String:smb2_get_error(_context)]
                 : nil;
-            if (error) *error = SMB2POSIXErrorFromResult(cb.result, errStr);
+            uint32_t ntStatus = (uint32_t)smb2_get_nterror(_context);
+            if ((ntStatus & 0xC0000000u) == 0xC0000000u) {
+                if (error) *error = SMB2POSIXErrorFromNTStatus(ntStatus);
+            } else if (error) {
+                *error = SMB2POSIXErrorFromResult(cb.result, errStr);
+            }
             return cb.result;
         }
 

@@ -97,7 +97,10 @@ static NSString *const kCodingKeyTimeout = @"timeout";
     _smb2Domain = currentDomain;
     _smb2Workstation = workstation;
     _smb2User = user;
-    _smb2Password = credential.password ?: @"";
+    // Preserve a nil password (do NOT coerce to @""): SMB2Client uses nil-vs-empty to choose the auth
+    // mode (nil -> anonymous/null session, @"" -> named login with empty password, e.g. guest). Coercing
+    // nil to @"" would make a caller-requested anonymous attempt indistinguishable from a guest attempt.
+    _smb2Password = credential.password;
     _internalTimeout = 60.0;
 
     return self;

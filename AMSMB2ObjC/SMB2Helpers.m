@@ -14,6 +14,7 @@
 #pragma mark - Error Helpers
 
 NSString *const SMB2ErrorDomain = @"SMB2ErrorDomain";
+NSString *const SMB2NTStatusErrorKey = @"SMB2NTStatus";
 
 NSError *_Nullable SMB2POSIXErrorFromResult(int32_t result, NSString *_Nullable description) {
     if (result >= 0) {
@@ -48,7 +49,10 @@ NSError *_Nullable SMB2POSIXErrorFromNTStatus(uint32_t status) {
     } else {
         description = [NSString stringWithFormat:@"Error 0x%X", status];
     }
-    NSDictionary *userInfo = @{NSLocalizedDescriptionKey: description};
+    // Carry the raw NT_STATUS so callers can act on the exact server reason (e.g. STATUS_LOGON_FAILURE
+    // 0xC000006D) instead of only the lossy POSIX errno in `code`.
+    NSDictionary *userInfo = @{ NSLocalizedDescriptionKey: description,
+                                SMB2NTStatusErrorKey: @(status) };
     return [NSError errorWithDomain:NSPOSIXErrorDomain code:code userInfo:userInfo];
 }
 

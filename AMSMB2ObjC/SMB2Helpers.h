@@ -16,6 +16,10 @@ NS_ASSUME_NONNULL_BEGIN
 #pragma mark - Error Helpers
 
 FOUNDATION_EXPORT NSString *const SMB2ErrorDomain;
+/// userInfo key on errors built from an SMB2 NT status: the raw 32-bit NT_STATUS (e.g. 0xC000006D
+/// STATUS_LOGON_FAILURE) as an NSNumber, so callers can act on the exact server reason instead of the
+/// lossy POSIX errno the NSError `code` carries.
+FOUNDATION_EXPORT NSString *const SMB2NTStatusErrorKey;
 
 NSError *_Nullable SMB2POSIXErrorFromResult(int32_t result, NSString *_Nullable description);
 NSError *_Nullable SMB2POSIXErrorFromNTStatus(uint32_t status);
