@@ -256,17 +256,28 @@ static void smb2_generic_handler(struct smb2_context *smb2, int status, void *co
         pfd.events = (short)smb2_which_events(_context);
 
         if (pfd.fd < 0 || (poll(&pfd, 1, 1000) < 0 && errno != EAGAIN)) {
-            if (error) {
-                NSString *desc = smb2_get_error(_context)
-                    ? [NSString stringWithUTF8String:smb2_get_error(_context)]
-                    : nil;
-                *error = SMB2POSIXError(errno, desc);
-            }
+            NSString *desc = smb2_get_error(_context)
+                ? [NSString stringWithUTF8String:smb2_get_error(_context)]
+                : nil;
+            // Abandoning the wait (socket error) leaves libsmb2 holding a pending request that still points at
+            // our STACK-allocated `cb`; a later smb2_service (e.g. the next echo) would then fire
+            // smb2_generic_handler on that freed stack -> EXC_BAD_ACCESS. Tear the context down so no stale
+            // callback can run and the now desynchronized connection is discarded, like the smb2_service < 0
+            // path below.
+            smb2_destroy_context(_context);
+            _context = NULL;
+            if (error) *error = SMB2POSIXError(errno, desc);
             return NO;
         }
 
         if (pfd.revents == 0) {
             if (self.timeout > 0 && [[NSDate date] timeIntervalSinceDate:startDate] > self.timeout) {
+                // Same lifetime hazard as the socket-error path above: a timed-out operation leaves its
+                // pending request (referencing our stack `cb`) registered in libsmb2, so a reply arriving on a
+                // later service call would call back into freed stack memory. Discard the context instead of
+                // leaving it desynchronized.
+                smb2_destroy_context(_context);
+                _context = NULL;
                 if (error) *error = SMB2POSIXError(ETIMEDOUT, nil);
                 return NO;
             }
