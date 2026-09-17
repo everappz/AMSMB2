@@ -29,6 +29,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <math.h>
+#include <sys/statvfs.h>
 
 #define AM_PAD_TO_64BIT(len) (((len) + 0x07) & ~0x07)
 #define AM_PAD_TO_32BIT(len) (((len) + 0x03) & ~0x03)
@@ -45,6 +46,33 @@
 NS_ASSUME_NONNULL_BEGIN
 
 #pragma mark - Conversions
+
+/// Reports the backing volume's real capacity for the FS-size queries. Finder pre-flights a copy against the
+/// advertised free space, so the old hardcoded ~256 MB free made it refuse any folder/file larger than that
+/// ("Not enough disk space to copy ..."). The app sandbox lives on the device's data volume, so statvfs of
+/// the home directory gives the true free/total bytes; express them as 512-byte allocation units. If statvfs
+/// fails, fall back to a large value so a copy is never wrongly blocked.
+static void AMVolumeAllocationUnits(uint64_t *outTotalUnits, uint64_t *outAvailableUnits,
+                                    uint32_t *outSectorsPerUnit, uint32_t *outBytesPerSector)
+{
+    const uint32_t bytesPerSector = 512;
+    const uint32_t sectorsPerUnit = 1;   // allocation unit = 512 bytes
+    uint64_t totalUnits = 0, availUnits = 0;
+    struct statvfs st;
+    if (statvfs([NSHomeDirectory() fileSystemRepresentation], &st) == 0 && st.f_frsize > 0) {
+        uint64_t blockSize = (uint64_t)st.f_frsize;
+        totalUnits = ((uint64_t)st.f_blocks * blockSize) / bytesPerSector;
+        availUnits = ((uint64_t)st.f_bavail * blockSize) / bytesPerSector;
+    }
+    if (totalUnits == 0 || availUnits == 0 || availUnits > totalUnits) {
+        totalUnits = 0x80000000ULL;   // ~1 TiB / 512
+        availUnits = 0x40000000ULL;   // ~512 GiB / 512
+    }
+    if (outTotalUnits)     { *outTotalUnits = totalUnits; }
+    if (outAvailableUnits) { *outAvailableUnits = availUnits; }
+    if (outSectorsPerUnit) { *outSectorsPerUnit = sectorsPerUnit; }
+    if (outBytesPerSector) { *outBytesPerSector = bytesPerSector; }
+}
 
 static uint64_t AMWinTimeFromDate(NSDate *_Nullable date)
 {
@@ -2100,10 +2128,8 @@ static int am_query_info(struct smb2_server *srvr, struct smb2_context *smb2, st
             switch (req->file_info_class) {
                 case SMB2_FILE_FS_SIZE_INFORMATION: {
                     struct smb2_file_fs_size_info *fs = calloc(1, sizeof(*fs));
-                    fs->total_allocation_units = 0x100000;
-                    fs->available_allocation_units = 0x80000;
-                    fs->sectors_per_allocation_unit = 1;
-                    fs->bytes_per_sector = 512;
+                    AMVolumeAllocationUnits(&fs->total_allocation_units, &fs->available_allocation_units,
+                                            &fs->sectors_per_allocation_unit, &fs->bytes_per_sector);
                     buffer = fs;
                     length = sizeof(*fs);
                     break;
@@ -2151,13 +2177,15 @@ static int am_query_info(struct smb2_server *srvr, struct smb2_context *smb2, st
                     break;
                 }
                 case SMB2_FILE_FS_FULL_SIZE_INFORMATION: {
-                    // Free/total space for Finder's capacity bar (~512 MB free).
+                    // Real free/total space for Finder's capacity bar AND its copy pre-flight (see
+                    // AMVolumeAllocationUnits). caller/actual available are the same here (no per-user quota).
                     struct smb2_file_fs_full_size_info *fs = calloc(1, sizeof(*fs));
-                    fs->total_allocation_units = 0x100000;
-                    fs->caller_available_allocation_units = 0x80000;
-                    fs->actual_available_allocation_units = 0x80000;
-                    fs->sectors_per_allocation_unit = 1;
-                    fs->bytes_per_sector = 512;
+                    uint64_t totalUnits = 0, availUnits = 0;
+                    AMVolumeAllocationUnits(&totalUnits, &availUnits,
+                                            &fs->sectors_per_allocation_unit, &fs->bytes_per_sector);
+                    fs->total_allocation_units = totalUnits;
+                    fs->caller_available_allocation_units = availUnits;
+                    fs->actual_available_allocation_units = availUnits;
                     buffer = fs;
                     length = sizeof(*fs);
                     break;
