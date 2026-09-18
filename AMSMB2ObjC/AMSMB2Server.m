@@ -1585,6 +1585,20 @@ static int am_ioctl(struct smb2_server *srvr, struct smb2_context *smb2, struct 
             return -1;
         }
 
+        // Decline server-side copy offload (copychunk). macOS smbfs uses it for a
+        // Finder copy whose source and destination are on the SAME share (e.g.
+        // duplicating a folder inside one connected folder), and answering the
+        // resume-key request there made a folder copy fail with "the operation
+        // can't be completed because it isn't supported". Reporting the copy-offload
+        // FSCTLs as unsupported makes smbfs fall back to a normal read/write copy,
+        // which works reliably (every cross-machine copy in the wild already uses
+        // it). Reparse-point (symlink) and pipe IOCTLs are unaffected and still work.
+        if (req->ctl_code == SMB2_FSCTL_SRV_REQUEST_RESUME_KEY ||
+            req->ctl_code == SMB2_FSCTL_SRV_COPYCHUNK ||
+            req->ctl_code == SMB2_FSCTL_SRV_COPYCHUNK_WRITE) {
+            return -1;
+        }
+
         AMSMB2ServerConnection *conn = [server connectionForContext:smb2 create:NO];
         id<AMSMB2ServerDelegate> delegate = server.delegate;
 
